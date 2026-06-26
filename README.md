@@ -1,130 +1,275 @@
-# SphereAR: Hyperspherical Latents Improve Continuous-Token Autoregressive Generation
+# SphereAR DMD2 One-Step Distillation
 
-[![arXiv](https://img.shields.io/badge/arXiv-2509.24335-b31b1b.svg)](https://arxiv.org/abs/2509.24335)&nbsp;
-[![huggingface](https://img.shields.io/badge/%F0%9F%A4%97%20HuggingFace-SphereAR-yellow)](https://huggingface.co/guolinke/SphereAR)&nbsp;
+This repository adds a DMD2-style one-step distillation pipeline for the SphereAR diffusion head.
 
+## Algorithm
 
-<p align="center">
-<img src="figures/grid.jpg" width=780>
-<p>
+The distillation pipeline trains a one-step student head on top of a frozen SphereAR teacher. The teacher provides the VAE, autoregressive trunk, class conditioning path, and pretrained diffusion head. The default prefix mode is teacher forcing: the teacher first samples a clean latent token sequence with its multi-step diffusion head, then the frozen AR trunk builds per-token conditions from the teacher clean prefix. The student maps one noise vector plus the current AR condition to one hyperspherical latent token.
 
-This is the official PyTorch implementation of paper [Hyperspherical Latents Improve Continuous-Token Autoregressive Generation](https://arxiv.org/abs/2509.24335).
+The student head is initialized from the teacher diffusion head. For each generated latent token, the one-step prediction is normalized with the same VAE latent normalization used by SphereAR sampling. The generated latent grid is decoded by the frozen VAE for the GAN generator loss.
 
-```
-@article{ke2025hyperspherical,
-   title={Hyperspherical Latents Improve Continuous-Token Autoregressive Generation}, 
-   author={Guolin Ke and Hui Xue},
-   journal={arXiv preprint arXiv:2509.24335},
-   year={2025}
-}
-```
+The training code also supports `real` prefixes, which use VAE latents from the current real batch. Sampling uses the autoregressive student path.
 
+The generator objective is the weighted sum of:
 
-## Introduction
+- Distribution matching loss: generated latents are noised at a random timestep, then scored by the frozen teacher diffusion head and a trainable fake score head. Their predicted clean-latent gap defines the DMD gradient surrogate used to update the one-step student.
+- GAN generator loss: generated samples are evaluated by a class-conditional discriminator. The default domain is decoded images; `--gan-domain latent_grid`, `--gan-domain latent_token`, and `--gan-domain none` are available ablations.
 
-<p align="center"><img src="figures/overview.png" width=553><img src="figures/fid_vs_params.png" width=246></p>
+The fake score head is also initialized from the teacher diffusion head and is trained online on generated latents. The discriminator is trained on real ImageNet images with their dataset labels and decoded student samples with their sampled class labels. The same generated batch is reused for the student update, fake score update, and discriminator fake branch.
 
-SphereAR is a simple yet effective approach to continuous-token autoregressive (AR) image generation: it makes AR scale-invariant by constraining all AR inputs and outputs---**including after CFG**---to lie on a fixed-radius hypersphere (constant L2 norm) via hyperspherical VAEs. 
+Classifier-free guidance has two controls. `--teacher-sample-cfg-scale` controls the teacher samples used as clean prefixes in `teacher_forcing` mode. `--cfg-scale` controls conditional/null score combination in the DMD loss and the student token prediction before latent normalization. The single-node baseline uses guided teacher prefixes with `--teacher-sample-cfg-scale 2.5` and keeps distillation CFG at `--cfg-scale 1.0`.
 
-The model is a **pure next-token** AR generator with **raster** order, matching standard language AR modeling (i.e., it is *not* next-scale AR like VAR and *not* next-set AR like MAR/MaskGIT). 
+`--token-sample-size` subsamples raster positions for the distribution matching and fake score losses. It also controls the sampled positions for `--gan-domain latent_token`; image and latent-grid GANs still use the full generated grid.
 
-On ImageNet 256×256, SphereAR achieves a state-of-the-art FID of **1.34** among AR image generators.
+Implemented entry points:
 
+- `distill_dmd2/train.py`: DDP training with `torchrun`
+- `distill_dmd2/sample_ddp.py`: DDP sampling with `torchrun`
+- `distill_dmd2/distiller.py`: teacher-forced prefixes, real prefixes, CFG, distribution matching, fake score training
+- `distill_dmd2/heads.py`: one-step student head and fake score head
+- `distill_dmd2/gan.py`: projection ResNet discriminator, discriminator builders, and adversarial losses
 
 ## Environment
 
-- PyTorch: 2.7.1 (CUDA 12.6 build)
-- FlashAttention: 2.8.1
+Use the same CUDA/PyTorch/FlashAttention environment as SphereAR training. The code expects CUDA and NCCL for training and sampling.
 
-### Install notes
-1.	Install PyTorch 2.7.1 (CUDA 12.6) using your preferred method.
-2.	Install FlashAttention 2.8.1 from the prebuilt wheel (replace the cp310 tag with your Python version, e.g., cp311 for Python 3.11):
-```shell
-pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.1/flash_attn-2.8.1+cu12torch2.7cxx11abiTRUE-cp310-cp310-linux_x86_64.whl
+Example package versions:
+
+```bash
+python -c "import torch; print(torch.__version__)"
+python -c "import flash_attn; print(flash_attn.__version__)"
 ```
 
+## Data Preparation
 
-## Class-conditional image generation on ImageNet
+Prepare ImageNet training data as either the official training tar or an ImageFolder directory.
 
-### Model Checkpoints 
+Tar layout:
 
-Name | params | FID (256x256) | weight 
---- |:---:|:---:|:---:|
-S-VAE | 75M | - | [vae.pt](https://huggingface.co/guolinke/SphereAR/blob/main/vae.pt)
-SphereAR-B   | 208M | 1.92 | [SphereAR_B.pt](https://huggingface.co/guolinke/SphereAR/blob/main/SphereAR_B.pt)
-SphereAR-L   | 479M | 1.54 | [SphereAR_L.pt](https://huggingface.co/guolinke/SphereAR/blob/main/SphereAR_L.pt)
-SphereAR-H   | 943M | 1.34 | [SphereAR_H.pt](https://huggingface.co/guolinke/SphereAR/blob/main/SphereAR_H.pt)
+```bash
+export DATA_PATH=/path/to/ILSVRC2012_img_train.tar
+```
 
-### Evaluation from checkpoints
+Folder layout:
 
-1. Sample 50,000 images and save to `.npz`.
+```bash
+export DATA_PATH=/path/to/imagenet/train
+```
 
-SphereAR-B:
-```shell
-ckpt=your_ckpt_path
-result_path=your_result_path
+When using the tar file, the dataloader creates an index file next to it:
+
+```bash
+/path/to/ILSVRC2012_img_train.tar.index
+```
+
+Make sure the directory containing the tar file is writable, or place the tar on local node storage before launching training.
+
+For FID/IS evaluation, download the ImageNet 256 reference batch:
+
+```bash
+export REF_NPZ=/path/to/VIRTUAL_imagenet256_labeled.npz
+wget -O $REF_NPZ \
+  https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz
+```
+
+## Checkpoint Preparation
+
+Prepare a pretrained SphereAR checkpoint containing either `ema` or `model` weights. The checkpoint is expected to include the VAE, AR trunk, and diffusion head; the distillation scripts do not load a separate VAE checkpoint.
+
+Example with a local checkpoint:
+
+```bash
+export TEACHER_CKPT=/path/to/SphereAR_B.pt
+```
+
+Example download location:
+
+- `SphereAR_B.pt`: https://huggingface.co/guolinke/SphereAR/blob/main/SphereAR_B.pt
+- `SphereAR_L.pt`: https://huggingface.co/guolinke/SphereAR/blob/main/SphereAR_L.pt
+- `SphereAR_H.pt`: https://huggingface.co/guolinke/SphereAR/blob/main/SphereAR_H.pt
+
+Use the matching model name when launching distillation:
+
+```bash
+export MODEL=SphereAR-B
+```
+
+## Training
+
+Single-node 8-GPU A100 baseline example:
+
+```bash
+export DATA_PATH=/path/to/ILSVRC2012_img_train.tar
+export TEACHER_CKPT=/path/to/SphereAR_B.pt
+export RESULT_DIR=/path/to/runs/spherear_b_dmd2
+export MODEL=SphereAR-B
+
 torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
-sample_ddp.py --model SphereAR-B --ckpt $ckpt --cfg-scale 4.5 \
---sample-dir $result_path   --per-proc-batch-size 256 --to-npz
+  distill_dmd2/train.py \
+  --teacher-ckpt $TEACHER_CKPT \
+  --data-path $DATA_PATH \
+  --results-dir $RESULT_DIR \
+  --model $MODEL \
+  --image-size 256 \
+  --patch-size 16 \
+  --latent-dim 16 \
+  --global-batch-size 512 \
+  --grad-accum-steps 4 \
+  --student-lr 2e-6 \
+  --fake-score-lr 2e-6 \
+  --disc-lr 2e-6 \
+  --dm-weight 1.0 \
+  --gan-weight 3e-3 \
+  --dfake-gen-update-ratio 5 \
+  --prefix-mode teacher_forcing \
+  --teacher-sample-steps 100 \
+  --teacher-sample-cfg-scale 2.5 \
+  --token-sample-size 256 \
+  --cfg-scale 1.0 \
+  --cfg-schedule linear \
+  --gan-domain image \
+  --disc-type resnet \
+  --disc-dim 64 \
+  --gan-loss hinge \
+  --log-every 50 \
+  --ckpt-every 1000 \
+  --preview-every 1000 \
+  --preview-num 16 \
+  --preview-batch-size 8 \
+  --mixed-precision bf16
 ```
 
-SphereAR-L:
-```shell
-ckpt=your_ckpt_path
-result_path=your_result_path
+Multi-node example:
+
+```bash
+export DATA_PATH=/path/to/ILSVRC2012_img_train.tar
+export TEACHER_CKPT=/path/to/SphereAR_B.pt
+export RESULT_DIR=/path/to/runs/spherear_b_dmd2
+export MODEL=SphereAR-B
+export WORKER_NUM=2
+export NODE_RANK=0
+export WORKER_0_HOST=master.host
+export WORKER_0_PORT=29500
+
+torchrun --nproc_per_node=8 \
+  --nnodes=$WORKER_NUM \
+  --node_rank=$NODE_RANK \
+  --master_addr=$WORKER_0_HOST \
+  --master_port=$WORKER_0_PORT \
+  distill_dmd2/train.py \
+  --teacher-ckpt $TEACHER_CKPT \
+  --data-path $DATA_PATH \
+  --results-dir $RESULT_DIR \
+  --model $MODEL \
+  --image-size 256 \
+  --patch-size 16 \
+  --latent-dim 16 \
+  --global-batch-size 128 \
+  --grad-accum-steps 1 \
+  --student-lr 2e-6 \
+  --fake-score-lr 2e-6 \
+  --disc-lr 2e-6 \
+  --dm-weight 1.0 \
+  --gan-weight 3e-3 \
+  --dfake-gen-update-ratio 5 \
+  --prefix-mode teacher_forcing \
+  --teacher-sample-steps 100 \
+  --teacher-sample-cfg-scale 1.0 \
+  --token-sample-size 64 \
+  --cfg-scale 1.0 \
+  --gan-domain image \
+  --disc-type resnet \
+  --gan-loss hinge \
+  --mixed-precision bf16
+```
+
+Training writes checkpoints to:
+
+```bash
+$RESULT_DIR/last.pt
+$RESULT_DIR/epoch_*.pt
+```
+
+The single-node command logs every 50 optimizer steps, overwrites `last.pt` every 1000 optimizer steps, and saves 16 preview PNGs plus a grid every 1000 optimizer steps. Training-time preview sampling does not run FID/IS.
+
+Resume from an existing run:
+
+```bash
 torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
-sample_ddp.py --model SphereAR-L --ckpt $ckpt --cfg-scale 4.6 \
---sample-dir $result_path   --per-proc-batch-size 256 --to-npz
+  distill_dmd2/train.py \
+  --teacher-ckpt $TEACHER_CKPT \
+  --data-path $DATA_PATH \
+  --results-dir $RESULT_DIR \
+  --resume $RESULT_DIR/last.pt \
+  --model $MODEL \
+  --image-size 256 \
+  --patch-size 16 \
+  --latent-dim 16 \
+  --global-batch-size 64 \
+  --grad-accum-steps 1 \
+  --prefix-mode teacher_forcing \
+  --teacher-sample-steps 100
 ```
 
-SphereAR-H:
-```shell
-ckpt=your_ckpt_path
-result_path=your_result_path
+Useful training options:
+
+```bash
+--max-steps 200000
+--grad-accum-steps 2
+--ckpt-every 1000
+--log-every 50
+--preview-every 1000 --preview-num 16
+--disc-dim 64
+--prefix-mode real
+--gan-domain image
+--gan-domain latent_grid
+--gan-domain latent_token
+--gan-domain none
+--token-sample-size 64
+--token-sample-size -1
+--teacher-sample-cfg-scale 1.0
+--cfg-scale 1.0
+--cfg-scale 4.5
+```
+
+## Sampling
+
+Sample with the distilled student:
+
+```bash
+export TEACHER_CKPT=/path/to/SphereAR_B.pt
+export DISTILL_CKPT=/path/to/runs/spherear_b_dmd2/last.pt
+export SAMPLE_DIR=/path/to/samples
+export MODEL=SphereAR-B
+
 torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
-sample_ddp.py --model SphereAR-H --ckpt $ckpt --cfg-scale 4.5 \
---sample-dir $result_path   --per-proc-batch-size 256 --to-npz
+  distill_dmd2/sample_ddp.py \
+  --teacher-ckpt $TEACHER_CKPT \
+  --distill-ckpt $DISTILL_CKPT \
+  --sample-dir $SAMPLE_DIR \
+  --model $MODEL \
+  --image-size 256 \
+  --patch-size 16 \
+  --latent-dim 16 \
+  --per-proc-batch-size 32 \
+  --num-fid-samples 50000 \
+  --cfg-scale 1.0 \
+  --cfg-schedule linear \
+  --mixed-precision bf16 \
+  --to-npz
 ```
 
-2. Compute metrics following [OpenAI’s evaluation protocol](https://github.com/openai/guided-diffusion/tree/main/evaluations). You should download the [reference batch](https://openaipublic.blob.core.windows.net/diffusion/jul-2021/ref_batches/imagenet/256/VIRTUAL_imagenet256_labeled.npz), and run `python evaluator.py VIRTUAL_imagenet256_labeled.npz your_generated.npz` for the metric. TensorFlow is required, and we use ```tensorflow==2.19.1```.
+The command writes PNGs and, with `--to-npz`, creates a `.npz` file for evaluation. Add `--keep-pngs` to retain the image folder after the `.npz` file is created.
 
+## Evaluation
 
-### Reproduce our training:
+Run the evaluator on the generated `.npz`:
 
-1. Download [ImageNet](http://image-net.org/download) dataset. **Note**: Our code support to train from the tar file, the decompression is not needed.
+```bash
+export REF_NPZ=/path/to/VIRTUAL_imagenet256_labeled.npz
+export GEN_NPZ=/path/to/generated_samples.npz
 
-2. Train the S-VAE:
-
-```shell
-data_path=your_data_path/ILSVRC2012_img_train.tar
-result_path=your_resulet_path
-torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
-train.py --results-dir $result_path --data-path $data_path \
---image-size 256 --epochs 100 --patch-size 16 --latent-dim 16  --vae-only \
---lr 1e-4 --global-batch-size 256 --warmup-steps -1 --decay-start -1
+python evaluator.py $REF_NPZ $GEN_NPZ
 ```
 
-3. Train the AR model:
-
-```shell
-data_path=your_data_path/ILSVRC2012_img_train.tar
-result_path=your_resulet_path
-vae_ckpt=your_vae_path
-torchrun --nproc_per_node=8 --master_addr=$WORKER_0_HOST --node_rank=$LOCAL_RANK --master_port=$WORKER_0_PORT --nnodes=$WORKER_NUM \
-train.py --results-dir $result_path --data-path $data_path --image-size 256 \
---model SphereAR-B --epochs 400 --patch-size 16 --latent-dim 16 \
---lr 3e-4 --global-batch-size 512 --trained-vae $vae_ckpt --ema 0.9999
-```
-You can use the script above to train `SphereAR-B`; to train other sizes, set `--model` to `SphereAR-L` or `SphereAR-H`.
-We trained on A100 GPUs with the following setups: 8×A100 for SphereAR-B, 16×A100 for SphereAR-L, and 32×A100 for SphereAR-H.
-The training costs about 3 days for 400 epochs.
-
-**Note**: We use `torch.compile` for acceleration. Occasionally the TorchInductor compile step can hang; if that happens, re-run the job. Enabling Dynamo logs tends to reduce stalls: `export TORCH_LOGS="+dynamo"`.  To avoid repeated compilation cost across runs, enable the compile caches:
-
-```shell
-export TORCHINDUCTOR_FX_GRAPH_CACHE=1
-export TORCHINDUCTOR_AUTOGRAD_CACHE=1
-```
-
-Set these environment variables in your shell (or job script) before launching training.
-
+The evaluator follows the OpenAI guided-diffusion ImageNet reference batch protocol.
