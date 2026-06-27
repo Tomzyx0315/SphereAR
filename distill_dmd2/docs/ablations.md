@@ -482,6 +482,7 @@ Flags:
 ```bash
 --seed 99
 --sample-dir samples
+--sample-name ""
 --to-npz
 --keep-pngs
 ```

@@ -1,5 +1,6 @@
 import math
 import os
+import re
 import shutil
 import sys
 import time
@@ -20,6 +21,17 @@ from SphereAR.utils import requires_grad
 from distill_dmd2.ar_utils import load_ar_backbone_state_dict
 from distill_dmd2.distiller import SphereARDMD2Distiller
 from distill_dmd2.heads import OneStepHead
+
+
+def safe_path_part(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+
+
+def checkpoint_string(path):
+    ckpt_path = Path(path)
+    parent = safe_path_part(ckpt_path.parent.name)
+    stem = safe_path_part(ckpt_path.stem)
+    return f"{parent}-{stem}" if parent else stem
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000, keep_pngs=False):
@@ -81,13 +93,16 @@ def main(args):
     )
 
     model_string_name = args.model.replace("/", "-")
-    ckpt_string_name = (
-        os.path.basename(args.distill_ckpt).replace(".pth", "").replace(".pt", "")
-    )
+    ckpt_string_name = checkpoint_string(args.distill_ckpt)
     folder_name = (
         f"{model_string_name}-dmd2-{ckpt_string_name}-size-{args.image_size}-"
-        f"cfg-{args.cfg_scale}-seed-{args.seed}"
+        f"cfg-{args.cfg_scale}-{args.cfg_schedule}-seed-{args.seed}-"
+        f"n-{args.num_fid_samples}"
     )
+    if args.teacher_no_ema:
+        folder_name += "-teacher-noema"
+    if args.sample_name:
+        folder_name = safe_path_part(args.sample_name)
     sample_folder_dir = f"{args.sample_dir}/{folder_name}"
 
     if os.path.isfile(sample_folder_dir + ".npz"):
@@ -148,6 +163,7 @@ if __name__ == "__main__":
     parser.add_argument("--teacher-no-ema", action="store_true")
     parser.add_argument("--distill-ckpt", type=str, required=True)
     parser.add_argument("--sample-dir", type=str, default="samples")
+    parser.add_argument("--sample-name", type=str, default="")
     parser.add_argument("--per-proc-batch-size", type=int, default=32)
     parser.add_argument("--num-fid-samples", type=int, default=50000)
     parser.add_argument("--cfg-scale", type=float, default=1.0)

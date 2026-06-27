@@ -312,12 +312,14 @@ export TEACHER_CKPT=/path/to/SphereAR_B.pt
 export DISTILL_CKPT=/path/to/runs/spherear_b_dmd2/last.pt
 export SAMPLE_DIR=/path/to/samples
 export MODEL=SphereAR-B
+export RUN_NAME=spherear_b_dmd2_last_cfg1.0_seed99_n50000
 
 torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   distill_dmd2/sample_ddp.py \
   --teacher-ckpt $TEACHER_CKPT \
   --distill-ckpt $DISTILL_CKPT \
   --sample-dir $SAMPLE_DIR \
+  --sample-name $RUN_NAME \
   --model $MODEL \
   --image-size 256 \
   --patch-size 16 \
@@ -338,7 +340,7 @@ Run the evaluator on the generated `.npz`:
 
 ```bash
 export REF_NPZ=/path/to/VIRTUAL_imagenet256_labeled.npz
-export GEN_NPZ=/path/to/generated_samples.npz
+export GEN_NPZ=$SAMPLE_DIR/$RUN_NAME.npz
 
 python evaluator.py $REF_NPZ $GEN_NPZ
 ```
