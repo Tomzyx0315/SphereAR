@@ -90,9 +90,19 @@ class Attention(nn.Module):
         self.k_cache = None
         self.v_cache = None
         self.kv_cache_size = None
+        self.detach_kv_cache = False
 
     def enable_kv_cache(self, bsz, max_seq_len):
-        if self.kv_cache_size != (bsz, max_seq_len):
+        needs_init = (
+            self.kv_cache_size != (bsz, max_seq_len)
+            or self.k_cache is None
+            or self.v_cache is None
+            or self.k_cache.shape[2] != max_seq_len
+            or self.v_cache.shape[2] != max_seq_len
+            or self.k_cache.requires_grad
+            or self.v_cache.requires_grad
+        )
+        if needs_init:
             device = self.wo.weight.device
             dtype = self.wo.weight.dtype
             self.k_cache = torch.zeros(
@@ -110,6 +120,26 @@ class Attention(nn.Module):
     def update_kv_cache(
         self, start_pos, end_pos, keys: torch.Tensor, values: torch.Tensor
     ):
+        if keys.requires_grad or values.requires_grad:
+            if start_pos == 0:
+                self.k_cache = keys
+                self.v_cache = values
+            else:
+                if self.k_cache is None or self.v_cache is None:
+                    raise RuntimeError("KV cache must be initialized before appending.")
+                prefix_k = self.k_cache[:, :, :start_pos, :]
+                prefix_v = self.v_cache[:, :, :start_pos, :]
+                if self.detach_kv_cache:
+                    prefix_k = prefix_k.detach()
+                    prefix_v = prefix_v.detach()
+                if prefix_k.shape[2] != start_pos or prefix_v.shape[2] != start_pos:
+                    raise RuntimeError(
+                        f"KV cache has length {prefix_k.shape[2]}, expected {start_pos}."
+                    )
+                self.k_cache = torch.cat([prefix_k, keys], dim=2)
+                self.v_cache = torch.cat([prefix_v, values], dim=2)
+            return self.k_cache, self.v_cache
+
         self.k_cache[:, :, start_pos:end_pos, :] = keys
         self.v_cache[:, :, start_pos:end_pos, :] = values
         return (

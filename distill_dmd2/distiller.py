@@ -67,7 +67,9 @@ class SphereARDMD2Distiller:
         pred = self.teacher.vae.normalize(pred.view(pred.shape[0], 1, -1))
         return pred
 
-    def _run_ar_step(self, ar_input, start_pos, end_pos):
+    def _run_ar_step(self, ar_input, start_pos, end_pos, requires_grad=False):
+        if requires_grad:
+            return self.teacher.forward_model_uncompiled(ar_input, start_pos, end_pos)
         with torch.no_grad():
             return self.teacher.forward_model(ar_input, start_pos, end_pos)
 
@@ -186,10 +188,13 @@ class SphereARDMD2Distiller:
         latents = self._generate_from_conditions(class_id, conds, requires_grad)
         return latents, conds
 
-    def generate_latents_autoregressive(self, class_id, requires_grad=False):
-        """Generate a full latent grid by feeding student tokens back to the AR trunk."""
-        if requires_grad:
-            raise ValueError("Autoregressive student-prefix generation is sampling-only.")
+    def generate_latents_self_forcing(
+        self,
+        class_id,
+        requires_grad=True,
+        detach_cache=False,
+    ):
+        """Roll out student tokens autoregressively and keep the AR graph when requested."""
         teacher = self.teacher
         cfg_mult = self.cfg_mult
         if cfg_mult == 2:
@@ -200,6 +205,8 @@ class SphereARDMD2Distiller:
 
         bsz = class_for_ar.shape[0]
         act_bsz = class_id.shape[0]
+        old_detach_cache = teacher.layers[0].attention.detach_kv_cache
+        teacher.set_kv_cache_detach(detach_cache)
         teacher.enable_kv_cache(bsz)
         class_tokens = teacher.cls_embedding(class_for_ar).view(
             bsz, teacher.cls_token_num, -1
@@ -208,29 +215,50 @@ class SphereARDMD2Distiller:
         latents = []
         conds = []
         last_pred = None
-        with torch.no_grad():
-            for pos in range(teacher.h * teacher.w):
-                if pos == 0:
-                    x = self._run_ar_step(class_tokens, 0, teacher.cls_token_num)
-                else:
-                    ar_token = teacher.proj_in(last_pred)
-                    x = self._run_ar_step(
-                        ar_token,
-                        pos + teacher.cls_token_num - 1,
-                        pos + teacher.cls_token_num,
-                    )
-                cond = x[:, -1:, :] + teacher.pos_for_diff.weight[pos : pos + 1, :]
-                cond_flat = cond.view(-1, cond.shape[-1])
-                conds.append(cond_flat)
+        grad_context = nullcontext() if requires_grad else torch.no_grad()
+        try:
+            with grad_context:
+                for pos in range(teacher.h * teacher.w):
+                    if pos == 0:
+                        x = self._run_ar_step(
+                            class_tokens,
+                            0,
+                            teacher.cls_token_num,
+                            requires_grad=requires_grad,
+                        )
+                    else:
+                        ar_token = teacher.proj_in(last_pred)
+                        x = self._run_ar_step(
+                            ar_token,
+                            pos + teacher.cls_token_num - 1,
+                            pos + teacher.cls_token_num,
+                            requires_grad=requires_grad,
+                        )
+                    cond = x[:, -1:, :] + teacher.pos_for_diff.weight[pos : pos + 1, :]
+                    cond_flat = cond.view(-1, cond.shape[-1])
+                    conds.append(cond_flat)
 
-                noise = torch.randn(
-                    act_bsz, teacher.latent_dim, device=class_id.device
-                )
-                pred = self._student_step(noise, cond_flat, pos)
-                latents.append(pred)
-                last_pred = pred if cfg_mult == 1 else torch.cat([pred, pred], dim=0)
+                    noise = torch.randn(
+                        act_bsz, teacher.latent_dim, device=class_id.device
+                    )
+                    pred = self._student_step(noise, cond_flat, pos)
+                    latents.append(pred)
+                    prefix_pred = pred.detach() if detach_cache else pred
+                    last_pred = (
+                        prefix_pred
+                        if cfg_mult == 1
+                        else torch.cat([prefix_pred, prefix_pred], dim=0)
+                    )
+        finally:
+            teacher.set_kv_cache_detach(old_detach_cache)
 
         return torch.cat(latents, dim=1), torch.stack(conds, dim=1)
+
+    def generate_latents_autoregressive(self, class_id, requires_grad=False):
+        """Generate a full latent grid by feeding student tokens back to the AR trunk."""
+        if requires_grad:
+            return self.generate_latents_self_forcing(class_id, requires_grad=True)
+        return self.generate_latents_self_forcing(class_id, requires_grad=False)
 
     def generate_latents(
         self,
@@ -241,7 +269,17 @@ class SphereARDMD2Distiller:
         teacher_sample_steps=100,
         teacher_cfg_scale=1.0,
         teacher_cfg_schedule="linear",
+        self_forcing=False,
+        self_forcing_detach_cache=False,
     ):
+        if self_forcing:
+            if prefix_mode != "teacher_forcing":
+                raise ValueError("self-forcing is only supported with teacher_forcing.")
+            return self.generate_latents_self_forcing(
+                class_id,
+                requires_grad=requires_grad,
+                detach_cache=self_forcing_detach_cache,
+            )
         if prefix_mode == "teacher_forcing":
             return self.generate_latents_teacher_forcing(
                 class_id,

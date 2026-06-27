@@ -20,6 +20,14 @@ from torch.utils.data.distributed import DistributedSampler
 from SphereAR.dataset import build_dataset
 from SphereAR.model import create_model, get_model_args
 from SphereAR.utils import create_logger, requires_grad
+from distill_dmd2.ar_utils import (
+    all_reduce_trainable_grads,
+    ar_backbone_parameters,
+    ar_backbone_state_dict,
+    load_ar_backbone_state_dict,
+    set_ar_backbone_trainable,
+    set_module_requires_grad,
+)
 from distill_dmd2.distiller import SphereARDMD2Distiller, unwrap_model
 from distill_dmd2.gan import (
     build_discriminator,
@@ -77,6 +85,7 @@ def save_checkpoint(
     args,
     epoch,
     step,
+    teacher,
     student_head,
     fake_score_head,
     discriminator,
@@ -94,8 +103,11 @@ def save_checkpoint(
         "optimizer_fake": opt_fake.state_dict(),
         "epoch": epoch,
         "step": step,
+        "self_forcing": args.self_forcing,
         "args": args,
     }
+    if args.self_forcing:
+        checkpoint["ar_backbone"] = ar_backbone_state_dict(teacher)
     if discriminator is not None:
         checkpoint["discriminator"] = unwrap_model(discriminator).state_dict()
     if opt_disc is not None:
@@ -170,16 +182,43 @@ def save_preview_samples(args, distiller, step, device, ptdtype, logger):
         save_image_grid(saved_images, os.path.join(step_dir, "grid.png"))
         logger.info(f"Saved {len(saved_images)} preview samples to {step_dir}")
     finally:
-        distiller.teacher.train(teacher_was_training)
+        if args.self_forcing:
+            set_ar_backbone_trainable(distiller.teacher, True)
+        else:
+            distiller.teacher.train(teacher_was_training)
         student.train(student_was_training)
 
 
-def load_resume(args, student_head, fake_score_head, discriminator,
-                opt_student, opt_fake, opt_disc, logger):
-    path = args.resume if args.resume else os.path.join(args.results_dir, "last.pt")
-    if not path or not os.path.exists(path):
-        return 0, 0
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+def checkpoint_self_forcing(checkpoint):
+    if "self_forcing" in checkpoint:
+        return bool(checkpoint["self_forcing"])
+    ckpt_args = checkpoint.get("args", None)
+    if ckpt_args is not None and hasattr(ckpt_args, "self_forcing"):
+        return bool(ckpt_args.self_forcing)
+    return "ar_backbone" in checkpoint
+
+
+def load_distill_weights(
+    args,
+    checkpoint,
+    teacher,
+    student_head,
+    fake_score_head,
+    discriminator,
+    logger,
+    source,
+    require_stage_match,
+):
+    ckpt_is_self_forcing = checkpoint_self_forcing(checkpoint)
+    if require_stage_match and ckpt_is_self_forcing != args.self_forcing:
+        current_stage = "self-forcing" if args.self_forcing else "teacher-forcing"
+        checkpoint_stage = "self-forcing" if ckpt_is_self_forcing else "teacher-forcing"
+        raise ValueError(
+            f"--resume expects a {current_stage} checkpoint, but {source} is a "
+            f"{checkpoint_stage} checkpoint. Use --init-from for weight-only "
+            "initialization between stages."
+        )
+
     unwrap_model(student_head).load_state_dict(checkpoint["student_head"], strict=True)
     unwrap_model(fake_score_head).load_state_dict(
         checkpoint["fake_score_head"], strict=True
@@ -188,11 +227,95 @@ def load_resume(args, student_head, fake_score_head, discriminator,
         unwrap_model(discriminator).load_state_dict(
             checkpoint["discriminator"], strict=True
         )
+    elif require_stage_match and discriminator is not None:
+        raise ValueError(
+            f"--resume expected discriminator weights in {source}. Check that "
+            "--gan-domain matches the resumed run."
+        )
+    elif require_stage_match and discriminator is None and "discriminator" in checkpoint:
+        raise ValueError(
+            f"--resume found discriminator weights in {source}, but the current "
+            "configuration has --gan-domain none."
+        )
+    if "ar_backbone" in checkpoint:
+        if args.self_forcing:
+            load_ar_backbone_state_dict(teacher, checkpoint["ar_backbone"])
+            logger.info(f"Loaded self-forcing AR backbone weights from {source}.")
+        else:
+            logger.info(
+                f"Ignored AR backbone weights in {source} because --self-forcing "
+                "is disabled."
+            )
+    elif args.self_forcing:
+        if require_stage_match:
+            raise ValueError(
+                f"{source} is a self-forcing resume checkpoint but has no "
+                "ar_backbone state."
+            )
+        logger.info(
+            f"{source} has no ar_backbone; self-forcing keeps the AR backbone "
+            "loaded from --teacher-ckpt."
+        )
+
+
+def load_init_from(args, teacher, student_head, fake_score_head, discriminator, logger):
+    if not args.init_from:
+        return
+    if not os.path.exists(args.init_from):
+        raise FileNotFoundError(f"--init-from checkpoint not found: {args.init_from}")
+    checkpoint = torch.load(args.init_from, map_location="cpu", weights_only=False)
+    load_distill_weights(
+        args,
+        checkpoint,
+        teacher,
+        student_head,
+        fake_score_head,
+        discriminator,
+        logger,
+        args.init_from,
+        require_stage_match=False,
+    )
+    logger.info(
+        f"Initialized distillation weights from {args.init_from}; optimizer, epoch, "
+        "and step were not loaded."
+    )
+
+
+def load_resume(args, teacher, student_head, fake_score_head, discriminator,
+                opt_student, opt_fake, opt_disc, logger):
+    if not args.resume:
+        return 0, 0
+    if not os.path.exists(args.resume):
+        raise FileNotFoundError(f"--resume checkpoint not found: {args.resume}")
+    checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+    load_distill_weights(
+        args,
+        checkpoint,
+        teacher,
+        student_head,
+        fake_score_head,
+        discriminator,
+        logger,
+        args.resume,
+        require_stage_match=True,
+    )
+    for key in ("optimizer_student", "optimizer_fake", "epoch", "step"):
+        if key not in checkpoint:
+            raise KeyError(f"--resume checkpoint {args.resume} is missing {key}.")
     opt_student.load_state_dict(checkpoint["optimizer_student"])
     opt_fake.load_state_dict(checkpoint["optimizer_fake"])
-    if opt_disc is not None and "optimizer_disc" in checkpoint:
+    if opt_disc is not None:
+        if "optimizer_disc" not in checkpoint:
+            raise KeyError(
+                f"--resume checkpoint {args.resume} is missing optimizer_disc."
+            )
         opt_disc.load_state_dict(checkpoint["optimizer_disc"])
-    logger.info(f"Resumed distillation from {path}")
+    elif "optimizer_disc" in checkpoint:
+        raise ValueError(
+            f"--resume found optimizer_disc in {args.resume}, but the current "
+            "configuration has --gan-domain none."
+        )
+    logger.info(f"Resumed distillation from {args.resume}")
     return checkpoint["epoch"], checkpoint["step"]
 
 
@@ -201,11 +324,6 @@ def reduce_scalar(value, device):
         value = torch.tensor(value, device=device, dtype=torch.float32)
     dist.all_reduce(value, op=dist.ReduceOp.SUM)
     return value / dist.get_world_size()
-
-
-def set_module_requires_grad(module, flag):
-    for param in module.parameters():
-        param.requires_grad_(flag)
 
 
 def ddp_sync_context(modules, sync_gradients):
@@ -260,6 +378,10 @@ def gan_inputs(args, distiller, images, latents, classes, position_indices):
     raise ValueError(f"Unknown GAN domain: {args.gan_domain}")
 
 
+def count_parameters(params):
+    return sum(param.numel() for param in params if param.requires_grad)
+
+
 def main(args):
     assert torch.cuda.is_available(), "DMD2 distillation requires CUDA."
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -278,7 +400,12 @@ def main(args):
         logger = create_logger(None)
     logger.info(args)
 
+    if args.resume and args.init_from:
+        raise ValueError("--resume and --init-from are mutually exclusive.")
+    if args.self_forcing and args.prefix_mode != "teacher_forcing":
+        raise ValueError("--self-forcing is only supported with --prefix-mode teacher_forcing.")
     teacher = load_teacher(args, device, logger)
+    set_ar_backbone_trainable(teacher, args.self_forcing)
     student_head = OneStepHead(teacher.head).to(device)
     fake_score_head = FakeScoreHead(teacher.head).to(device)
     discriminator = build_discriminator(
@@ -298,9 +425,10 @@ def main(args):
     if discriminator is not None:
         discriminator = DDP(discriminator, device_ids=[args.gpu])
 
-    opt_student = create_optimizer(
-        student_head.parameters(), args.student_lr, args.weight_decay
-    )
+    generator_params = list(student_head.parameters())
+    if args.self_forcing:
+        generator_params += list(ar_backbone_parameters(teacher))
+    opt_student = create_optimizer(generator_params, args.student_lr, args.weight_decay)
     opt_fake = create_optimizer(
         fake_score_head.parameters(), args.fake_score_lr, args.weight_decay
     )
@@ -310,8 +438,17 @@ def main(args):
         else None
     )
 
+    load_init_from(
+        args,
+        teacher,
+        student_head,
+        fake_score_head,
+        discriminator,
+        logger,
+    )
     start_epoch, train_steps = load_resume(
         args,
+        teacher,
         student_head,
         fake_score_head,
         discriminator,
@@ -351,6 +488,11 @@ def main(args):
         f"per-GPU microbatch: {per_gpu_batch}; "
         f"gradient accumulation steps: {args.grad_accum_steps}"
     )
+    logger.info(
+        f"Self-forcing: {args.self_forcing}; "
+        f"trainable student/generator params: {count_parameters(generator_params):,}; "
+        f"trainable AR backbone params: {count_parameters(list(ar_backbone_parameters(teacher))):,}"
+    )
 
     distiller = SphereARDMD2Distiller(
         teacher=teacher,
@@ -370,7 +512,10 @@ def main(args):
     running_counts = {}
     log_count = 0
     start_time = time.time()
-    logger.info(f"Training DMD2 baseline for up to {max_steps} steps")
+    if args.self_forcing:
+        logger.info(f"Training DMD2 self-forcing stage for up to {max_steps} steps")
+    else:
+        logger.info(f"Training DMD2 baseline for up to {max_steps} steps")
 
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
@@ -451,6 +596,8 @@ def main(args):
                             teacher_sample_steps=args.teacher_sample_steps,
                             teacher_cfg_scale=args.teacher_sample_cfg_scale,
                             teacher_cfg_schedule=args.teacher_sample_cfg_schedule,
+                            self_forcing=args.self_forcing,
+                            self_forcing_detach_cache=args.self_forcing_detach_cache,
                         )
                         position_indices = sample_position_indices(
                             generated_latents.shape[1],
@@ -560,9 +707,11 @@ def main(args):
                         step_logs[k] = step_logs.get(k, 0.0) + float(v.detach().float())
 
             if do_generator_update:
+                if args.self_forcing:
+                    all_reduce_trainable_grads(ar_backbone_parameters(teacher))
                 if args.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
-                        student_head.parameters(), args.max_grad_norm
+                        generator_params, args.max_grad_norm
                     )
                 opt_student.step()
             if args.max_grad_norm > 0:
@@ -617,6 +766,7 @@ def main(args):
                     args,
                     epoch,
                     train_steps,
+                    teacher,
                     student_head,
                     fake_score_head,
                     discriminator,
@@ -645,6 +795,7 @@ def main(args):
                 args,
                 save_epoch,
                 train_steps,
+                teacher,
                 student_head,
                 fake_score_head,
                 discriminator,
@@ -669,6 +820,12 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="dmd2_results")
     parser.add_argument("--resume", type=str, default="")
+    parser.add_argument(
+        "--init-from",
+        type=str,
+        default="",
+        help="Load distillation model weights only and start a fresh run from step 0.",
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--global-batch-size", type=int, default=64)
@@ -683,6 +840,24 @@ if __name__ == "__main__":
     parser.add_argument("--dm-weight", type=float, default=1.0)
     parser.add_argument("--gan-weight", type=float, default=3e-3)
     parser.add_argument("--dfake-gen-update-ratio", type=int, default=5)
+    parser.add_argument(
+        "--self-forcing",
+        action="store_true",
+        help="Use student autoregressive rollout as prefixes and train the AR backbone with the one-step head.",
+    )
+    detach_group = parser.add_mutually_exclusive_group()
+    detach_group.add_argument(
+        "--self-forcing-detach-cache",
+        action="store_true",
+        default=True,
+        help="Detach generated prefix tokens and previous KV cache during self-forcing.",
+    )
+    detach_group.add_argument(
+        "--no-self-forcing-detach-cache",
+        dest="self_forcing_detach_cache",
+        action="store_false",
+        help="Allow gradients through generated prefix tokens and previous KV cache during self-forcing.",
+    )
     parser.add_argument(
         "--prefix-mode",
         type=str,

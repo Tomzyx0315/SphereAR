@@ -205,8 +205,11 @@ class SphereAR(nn.Module):
         for layer in self.layers:
             layer.attention.enable_kv_cache(bsz, self.total_tokens)
 
-    @torch.compile()
-    def forward_model(self, x, start_pos, end_pos):
+    def set_kv_cache_detach(self, detach):
+        for layer in self.layers:
+            layer.attention.detach_kv_cache = detach
+
+    def forward_model_uncompiled(self, x, start_pos, end_pos):
         x = self.emb_norm(x)
         for layer in self.layers:
             x = layer.forward_onestep(
@@ -214,6 +217,10 @@ class SphereAR(nn.Module):
             )
         x = self.norm(x)
         return x
+
+    @torch.compile()
+    def forward_model(self, x, start_pos, end_pos):
+        return self.forward_model_uncompiled(x, start_pos, end_pos)
 
     def head_sample(self, x, diff_pos, sample_steps, cfg_scale, cfg_schedule="linear"):
         x = x + self.pos_for_diff.weight[diff_pos : diff_pos + 1, :]

@@ -17,6 +17,7 @@ from tqdm import tqdm
 
 from SphereAR.model import create_model, get_model_args
 from SphereAR.utils import requires_grad
+from distill_dmd2.ar_utils import load_ar_backbone_state_dict
 from distill_dmd2.distiller import SphereARDMD2Distiller
 from distill_dmd2.heads import OneStepHead
 
@@ -65,6 +66,8 @@ def main(args):
     teacher = load_teacher(args, device)
     student_head = OneStepHead(teacher.head).to(device)
     checkpoint = torch.load(args.distill_ckpt, map_location="cpu", weights_only=False)
+    if "ar_backbone" in checkpoint:
+        load_ar_backbone_state_dict(teacher, checkpoint["ar_backbone"])
     student_head.load_state_dict(checkpoint["student_head"], strict=True)
     student_head.eval()
 

@@ -10,6 +10,8 @@ The student head is initialized from the teacher diffusion head. For each genera
 
 The training code also supports `real` prefixes, which use VAE latents from the current real batch. Sampling uses the autoregressive student path.
 
+Self-forcing is available as a second-stage training mode with `--self-forcing`. In this mode, the student rolls out latent tokens autoregressively and the AR prefix for position `i` is built from previously generated student tokens. The one-step head and AR backbone are optimized together; the VAE and teacher diffusion head stay frozen. Self-forcing detaches previous generated tokens and previous KV cache entries by default; use `--no-self-forcing-detach-cache` for the full-history-gradient ablation. Self-forcing checkpoints store the updated AR backbone, and sampling loads it automatically.
+
 The generator objective is the weighted sum of:
 
 - Distribution matching loss: generated latents are noised at a random timestep, then scored by the frozen teacher diffusion head and a trainable fake score head. Their predicted clean-latent gap defines the DMD gradient surrogate used to update the one-step student.
@@ -26,6 +28,7 @@ Implemented entry points:
 - `distill_dmd2/train.py`: DDP training with `torchrun`
 - `distill_dmd2/sample_ddp.py`: DDP sampling with `torchrun`
 - `distill_dmd2/distiller.py`: teacher-forced prefixes, real prefixes, CFG, distribution matching, fake score training
+- `distill_dmd2/ar_utils.py`: AR backbone trainability, checkpoint, and DDP gradient helpers
 - `distill_dmd2/heads.py`: one-step student head and fake score head
 - `distill_dmd2/gan.py`: projection ResNet discriminator, discriminator builders, and adversarial losses
 
@@ -192,7 +195,7 @@ $RESULT_DIR/epoch_*.pt
 
 The single-node command logs every 50 optimizer steps, overwrites `last.pt` every 1000 optimizer steps, and saves 16 preview PNGs plus a grid every 1000 optimizer steps. Training-time preview sampling does not run FID/IS.
 
-Resume from an existing run:
+Resume from an existing run with optimizer, epoch, and step restored:
 
 ```bash
 torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
@@ -205,10 +208,75 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --image-size 256 \
   --patch-size 16 \
   --latent-dim 16 \
-  --global-batch-size 64 \
-  --grad-accum-steps 1 \
+  --global-batch-size 512 \
+  --grad-accum-steps 4 \
+  --student-lr 2e-6 \
+  --fake-score-lr 2e-6 \
+  --disc-lr 2e-6 \
+  --dm-weight 1.0 \
+  --gan-weight 3e-3 \
+  --dfake-gen-update-ratio 5 \
   --prefix-mode teacher_forcing \
-  --teacher-sample-steps 100
+  --teacher-sample-steps 100 \
+  --teacher-sample-cfg-scale 2.5 \
+  --token-sample-size 256 \
+  --cfg-scale 1.0 \
+  --cfg-schedule linear \
+  --gan-domain image \
+  --disc-type resnet \
+  --disc-dim 64 \
+  --gan-loss hinge \
+  --log-every 50 \
+  --ckpt-every 1000 \
+  --preview-every 1000 \
+  --preview-num 16 \
+  --preview-batch-size 8 \
+  --mixed-precision bf16
+```
+
+Use `--init-from /path/to/last.pt` to initialize model weights from another distillation run while starting a fresh run from step 0.
+
+Self-forcing second-stage example:
+
+```bash
+export DATA_PATH=/path/to/ILSVRC2012_img_train.tar
+export TEACHER_CKPT=/path/to/SphereAR_B.pt
+export STAGE1_CKPT=/path/to/runs/spherear_b_dmd2/last.pt
+export RESULT_DIR=/path/to/runs/spherear_b_dmd2_self_forcing
+export MODEL=SphereAR-B
+
+torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
+  distill_dmd2/train.py \
+  --teacher-ckpt $TEACHER_CKPT \
+  --data-path $DATA_PATH \
+  --results-dir $RESULT_DIR \
+  --init-from $STAGE1_CKPT \
+  --model $MODEL \
+  --image-size 256 \
+  --patch-size 16 \
+  --latent-dim 16 \
+  --global-batch-size 512 \
+  --grad-accum-steps 4 \
+  --student-lr 5e-7 \
+  --fake-score-lr 1e-6 \
+  --disc-lr 1e-6 \
+  --dm-weight 1.0 \
+  --gan-weight 3e-3 \
+  --dfake-gen-update-ratio 5 \
+  --prefix-mode teacher_forcing \
+  --self-forcing \
+  --token-sample-size 256 \
+  --cfg-scale 1.0 \
+  --gan-domain image \
+  --disc-type resnet \
+  --disc-dim 64 \
+  --gan-loss hinge \
+  --log-every 50 \
+  --ckpt-every 1000 \
+  --preview-every 1000 \
+  --preview-num 16 \
+  --preview-batch-size 8 \
+  --mixed-precision bf16
 ```
 
 Useful training options:
@@ -219,8 +287,11 @@ Useful training options:
 --ckpt-every 1000
 --log-every 50
 --preview-every 1000 --preview-num 16
+--init-from /path/to/stage1/last.pt
 --disc-dim 64
 --prefix-mode real
+--self-forcing
+--no-self-forcing-detach-cache
 --gan-domain image
 --gan-domain latent_grid
 --gan-domain latent_token

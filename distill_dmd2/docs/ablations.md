@@ -99,6 +99,9 @@ Flags:
 ```bash
 --prefix-mode teacher_forcing
 --prefix-mode real
+--self-forcing
+--self-forcing-detach-cache
+--no-self-forcing-detach-cache
 ```
 
 Modes:
@@ -107,6 +110,15 @@ Modes:
   AR trunk builds conditions from teacher clean prefixes.
 - `real`: VAE encodes the current real image batch; the frozen AR trunk builds
   conditions from real-image latent prefixes.
+- `--self-forcing`: second-stage mode used with `--prefix-mode teacher_forcing`.
+  The student rolls out tokens autoregressively, position `i` is conditioned on
+  generated tokens `< i`, and the AR backbone is trained together with the
+  one-step head. The VAE and teacher diffusion head remain frozen.
+- `--self-forcing` detaches previous generated tokens and previous KV cache
+  entries by default. The generated prefix values are still student samples,
+  but gradients are truncated across AR history.
+- `--no-self-forcing-detach-cache`: used with `--self-forcing` to allow
+  gradients through previous generated tokens and previous KV cache entries.
 
 Suggested comparisons:
 
@@ -116,6 +128,12 @@ Suggested comparisons:
 
 # Clean real-prefix diagnostic
 --prefix-mode real
+
+# On-policy prefix second stage
+--prefix-mode teacher_forcing --self-forcing
+
+# Full-history-gradient on-policy prefix second stage
+--prefix-mode teacher_forcing --self-forcing --no-self-forcing-detach-cache
 ```
 
 ### Teacher Prefix Sampling
@@ -130,7 +148,8 @@ Flags:
 ```
 
 These affect the teacher clean tokens used as prefixes in `teacher_forcing`
-mode.
+mode. They are ignored by `--self-forcing`, because self-forcing prefixes come
+from the student autoregressive rollout.
 
 Suggested comparisons:
 
@@ -311,6 +330,10 @@ Suggested comparisons:
 --student-lr 1e-6 --fake-score-lr 1e-6 --disc-lr 1e-6
 --student-lr 2e-6 --fake-score-lr 2e-6 --disc-lr 2e-6
 --student-lr 5e-6 --fake-score-lr 5e-6 --disc-lr 2e-6
+
+# Self-forcing fine-tuning from a stage-1 checkpoint
+--student-lr 5e-7 --fake-score-lr 1e-6 --disc-lr 1e-6
+
 --max-grad-norm 1.0
 --max-grad-norm 10.0
 ```
@@ -351,6 +374,7 @@ Flags:
 --preview-batch-size 0
 --preview-dir ""
 --preview-seed 1234
+--init-from ""
 ```
 
 Suggested comparisons:
@@ -371,7 +395,8 @@ Save behavior:
 - If `--keep-freq > 0`, completed epochs divisible by `keep_freq` also write
   `$results_dir/epoch_{epoch}.pt`.
 - Checkpoints contain the student head, fake score head, optional discriminator,
-  all optimizer states, `epoch`, `step`, and CLI args.
+  all optimizer states, `epoch`, `step`, `self_forcing`, and CLI args.
+- Self-forcing checkpoints also contain the updated AR backbone.
 - `step` is an optimizer step after gradient accumulation, not a microbatch.
 
 Preview behavior:
@@ -385,10 +410,17 @@ Preview behavior:
 - Preview sampling does not create `.npz` files and does not run FID/IS.
 - Other ranks wait at a barrier while rank 0 writes preview images.
 
-Resume behavior:
+Resume and initialization behavior:
 
-- `--resume /path/to/last.pt` loads that checkpoint.
-- If `--resume` is omitted, training tries `$results_dir/last.pt`.
+- `--resume /path/to/last.pt` fully resumes the same training stage.
+- Full resume restores model weights, optimizer states, `epoch`, and `step`.
+- `--resume` requires the checkpoint stage to match the current CLI stage:
+  teacher-forcing resumes teacher-forcing, and self-forcing resumes self-forcing.
+- `--init-from /path/to/last.pt` loads distillation model weights only and starts
+  a fresh run from epoch 0 and step 0.
+- Use `--init-from` when starting self-forcing from a teacher-forcing stage-1
+  checkpoint.
+- `--resume` and `--init-from` are mutually exclusive.
 - When resuming inside an epoch, the dataloader skips the already consumed
   microbatches implied by `step`, `epoch`, and `grad_accum_steps`.
 
@@ -473,7 +505,14 @@ Flags:
 ```
 
 The teacher checkpoint provides the frozen AR trunk and VAE. The distilled
-checkpoint provides the one-step student head.
+checkpoint provides the one-step student head. Self-forcing checkpoints also
+provide an `ar_backbone` state dict, and `distill_dmd2/sample_ddp.py` loads it
+automatically.
+
+When a self-forcing run is initialized from a teacher-forcing distillation
+checkpoint without `ar_backbone`, the AR backbone remains the one loaded from
+`--teacher-ckpt`; the one-step head, fake score head, and discriminator are
+loaded from the distillation checkpoint.
 
 ## Recommended Minimal Sweep
 
@@ -496,6 +535,8 @@ Then sweep one axis at a time:
 # Prefix mode
 --prefix-mode teacher_forcing
 --prefix-mode real
+--prefix-mode teacher_forcing --self-forcing
+--prefix-mode teacher_forcing --self-forcing --no-self-forcing-detach-cache
 
 # Token positions
 --token-sample-size 32
