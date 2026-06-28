@@ -117,7 +117,7 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --patch-size 16 \
   --latent-dim 16 \
   --global-batch-size 512 \
-  --grad-accum-steps 4 \
+  --grad-accum-steps 1 \
   --student-lr 2e-6 \
   --fake-score-lr 2e-6 \
   --disc-lr 2e-6 \
@@ -167,7 +167,7 @@ torchrun --nproc_per_node=8 \
   --image-size 256 \
   --patch-size 16 \
   --latent-dim 16 \
-  --global-batch-size 128 \
+  --global-batch-size 512 \
   --grad-accum-steps 1 \
   --student-lr 2e-6 \
   --fake-score-lr 2e-6 \
@@ -178,11 +178,18 @@ torchrun --nproc_per_node=8 \
   --prefix-mode teacher_forcing \
   --teacher-sample-steps 100 \
   --teacher-sample-cfg-scale 4.6 \
-  --token-sample-size 64 \
+  --token-sample-size 256 \
   --cfg-scale 1.0 \
+  --cfg-schedule linear \
   --gan-domain image \
   --disc-type resnet \
+  --disc-dim 64 \
   --gan-loss hinge \
+  --log-every 50 \
+  --ckpt-every 1000 \
+  --preview-every 1000 \
+  --preview-num 16 \
+  --preview-batch-size 8 \
   --mixed-precision bf16
 ```
 
@@ -211,7 +218,7 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --patch-size 16 \
   --latent-dim 16 \
   --global-batch-size 512 \
-  --grad-accum-steps 4 \
+  --grad-accum-steps 1 \
   --student-lr 2e-6 \
   --fake-score-lr 2e-6 \
   --disc-lr 2e-6 \
@@ -285,7 +292,7 @@ Useful training options:
 
 ```bash
 --max-steps 200000
---grad-accum-steps 2
+--grad-accum-steps 1
 --ckpt-every 1000
 --log-every 50
 --preview-every 1000 --preview-num 16

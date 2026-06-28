@@ -399,7 +399,7 @@ Suggested comparisons:
 --global-batch-size 64
 --global-batch-size 128
 --global-batch-size 256 --grad-accum-steps 2
---global-batch-size 512 --grad-accum-steps 4
+--global-batch-size 512 --grad-accum-steps 1
 --max-steps 50000
 --max-steps 200000
 ```
