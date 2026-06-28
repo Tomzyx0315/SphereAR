@@ -47,6 +47,7 @@ from distill_dmd2.gan import (
     generator_loss,
 )
 from distill_dmd2.heads import FakeScoreHead, OneStepHead
+from distill_dmd2.teacher_cache import TeacherPrefixCacheDataset, validate_teacher_cache
 
 
 def init_distributed_mode(args):
@@ -364,6 +365,15 @@ def sample_position_indices(seq_len, sample_size, device):
     return torch.randperm(seq_len, device=device)[:sample_size].sort().values
 
 
+def next_from_cycle(iterator, loader):
+    try:
+        batch = next(iterator)
+    except StopIteration:
+        iterator = iter(loader)
+        batch = next(iterator)
+    return batch, iterator
+
+
 def token_gan_inputs(latents, classes, position_indices):
     bsz, seq_len, latent_dim = latents.shape
     if position_indices is None:
@@ -416,6 +426,8 @@ def main(args):
         raise ValueError("--resume and --init-from are mutually exclusive.")
     if args.self_forcing and args.prefix_mode != "teacher_forcing":
         raise ValueError("--self-forcing is only supported with --prefix-mode teacher_forcing.")
+    if args.prefix_mode == "teacher_cache" and not args.teacher_cache_dir:
+        raise ValueError("--prefix-mode teacher_cache requires --teacher-cache-dir.")
     teacher = load_teacher(args, device, logger)
     set_ar_backbone_trainable(teacher, args.self_forcing)
     student_head = OneStepHead(teacher.head).to(device)
@@ -494,6 +506,40 @@ def main(args):
         pin_memory=True,
         drop_last=True,
     )
+    cache_loader = None
+    cache_sampler = None
+    if args.prefix_mode == "teacher_cache":
+        cache_meta = validate_teacher_cache(args.teacher_cache_dir, args)
+        cache_dataset = TeacherPrefixCacheDataset(args.teacher_cache_dir)
+        min_cache_samples = per_gpu_batch * dist.get_world_size()
+        if len(cache_dataset) < min_cache_samples:
+            raise ValueError(
+                "Teacher prefix cache is too small for the current world size and "
+                f"microbatch: len(cache)={len(cache_dataset)}, need at least "
+                f"{min_cache_samples} samples."
+            )
+        cache_sampler = DistributedSampler(
+            cache_dataset,
+            num_replicas=dist.get_world_size(),
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed + 17,
+        )
+        cache_loader = DataLoader(
+            cache_dataset,
+            batch_size=per_gpu_batch,
+            sampler=cache_sampler,
+            shuffle=False,
+            num_workers=args.teacher_cache_num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+        logger.info(
+            f"Teacher prefix cache contains {len(cache_dataset):,} samples "
+            f"({args.teacher_cache_dir}); "
+            f"cache teacher CFG: {cache_meta.get('teacher_sample_cfg_scale')}; "
+            f"cache teacher steps: {cache_meta.get('teacher_sample_steps')}"
+        )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
     logger.info(
         f"Effective global batch size: {args.global_batch_size}; "
@@ -531,9 +577,12 @@ def main(args):
 
     for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
+        if cache_sampler is not None:
+            cache_sampler.set_epoch(epoch)
         dataset.set_epoch(epoch)
         dataset.set_aug_ratio(1.0)
         loader_iter = iter(loader)
+        cache_iter = iter(cache_loader) if cache_loader is not None else None
 
         completed_steps_in_epoch = max(0, train_steps - epoch * steps_per_epoch)
         completed_steps_in_epoch = min(completed_steps_in_epoch, steps_per_epoch)
@@ -544,6 +593,8 @@ def main(args):
                     next(loader_iter)
                 except StopIteration:
                     break
+                if cache_iter is not None:
+                    _, cache_iter = next_from_cycle(cache_iter, cache_loader)
             logger.info(
                 f"Skipped {skip_microbatches} microbatches in epoch {epoch} "
                 f"after resuming at optimizer step {train_steps}."
@@ -557,9 +608,13 @@ def main(args):
             microbatches = []
             for _ in range(args.grad_accum_steps):
                 try:
-                    microbatches.append(next(loader_iter))
+                    real_batch = next(loader_iter)
                 except StopIteration:
                     break
+                cache_batch = None
+                if cache_iter is not None:
+                    cache_batch, cache_iter = next_from_cycle(cache_iter, cache_loader)
+                microbatches.append((real_batch, cache_batch))
             if len(microbatches) < args.grad_accum_steps:
                 break
 
@@ -576,7 +631,8 @@ def main(args):
 
             step_logs = {}
             accum_scale = 1.0 / args.grad_accum_steps
-            for accum_idx, (real_images, real_classes) in enumerate(microbatches):
+            for accum_idx, (real_batch, cache_batch) in enumerate(microbatches):
+                real_images, real_classes = real_batch
                 sync_gradients = accum_idx == args.grad_accum_steps - 1
                 with ddp_sync_context(
                     [student_head, fake_score_head, discriminator], sync_gradients
@@ -594,6 +650,10 @@ def main(args):
 
                     if args.prefix_mode == "real":
                         fake_classes = real_classes
+                    elif args.prefix_mode == "teacher_cache":
+                        cached_latents, cached_classes = cache_batch
+                        cached_latents = cached_latents.to(device, non_blocking=True)
+                        fake_classes = cached_classes.to(device, non_blocking=True)
                     else:
                         fake_classes = torch.randint(
                             0, args.num_classes, (real_images.shape[0],), device=device
@@ -604,7 +664,11 @@ def main(args):
                             fake_classes,
                             requires_grad=do_generator_update,
                             prefix_mode=args.prefix_mode,
-                            real_latents=real_latents,
+                            real_latents=(
+                                cached_latents
+                                if args.prefix_mode == "teacher_cache"
+                                else real_latents
+                            ),
                             teacher_sample_steps=args.teacher_sample_steps,
                             teacher_cfg_scale=args.teacher_sample_cfg_scale,
                             teacher_cfg_schedule=args.teacher_sample_cfg_schedule,
@@ -879,8 +943,10 @@ if __name__ == "__main__":
         "--prefix-mode",
         type=str,
         default="teacher_forcing",
-        choices=["teacher_forcing", "real"],
+        choices=["teacher_forcing", "real", "teacher_cache"],
     )
+    parser.add_argument("--teacher-cache-dir", type=str, default="")
+    parser.add_argument("--teacher-cache-num-workers", type=int, default=4)
     parser.add_argument("--teacher-sample-steps", type=int, default=100)
     parser.add_argument("--teacher-sample-cfg-scale", type=float, default=1.0)
     parser.add_argument(

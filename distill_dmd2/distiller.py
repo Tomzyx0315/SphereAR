@@ -294,6 +294,12 @@ class SphereARDMD2Distiller:
                 real_latents=real_latents,
                 requires_grad=requires_grad,
             )
+        if prefix_mode == "teacher_cache":
+            return self.generate_latents_real_prefix(
+                class_id,
+                real_latents=real_latents,
+                requires_grad=requires_grad,
+            )
         raise ValueError(f"Unknown prefix mode: {prefix_mode}")
 
     def decode_latents(self, latents):

@@ -10,6 +10,10 @@ The student head is initialized from the teacher diffusion head. For each genera
 
 The training code also supports `real` prefixes, which use VAE latents from the current real batch. Sampling uses the autoregressive student path.
 
+`teacher_cache` prefixes use offline-cached teacher clean latent grids. The AR
+conditions are still built online from those cached clean prefixes, but the
+expensive teacher multi-step sampling is removed from the training loop.
+
 Self-forcing is available as a second-stage training mode with `--self-forcing`. In this mode, the student rolls out latent tokens autoregressively and the AR prefix for position `i` is built from previously generated student tokens. The one-step head and AR backbone are optimized together; the VAE and teacher diffusion head stay frozen. Self-forcing detaches previous generated tokens and previous KV cache entries by default; use `--no-self-forcing-detach-cache` for the full-history-gradient ablation. Self-forcing checkpoints store the updated AR backbone, and sampling loads it automatically.
 
 The generator objective is the weighted sum of:
@@ -19,15 +23,16 @@ The generator objective is the weighted sum of:
 
 The fake score head is also initialized from the teacher diffusion head and is trained online on generated latents. The discriminator is trained on real ImageNet images with their dataset labels and decoded student samples with their sampled class labels. The same generated batch is reused for the student update, fake score update, and discriminator fake branch.
 
-Classifier-free guidance has two controls. `--teacher-sample-cfg-scale` controls the teacher samples used as clean prefixes in `teacher_forcing` mode. `--cfg-scale` controls conditional/null score combination in the DMD loss and the student token prediction before latent normalization. The single-node baseline uses guided teacher prefixes with `--teacher-sample-cfg-scale 4.6` and keeps distillation CFG at `--cfg-scale 1.0`.
+Classifier-free guidance has two controls. `--teacher-sample-cfg-scale` controls the teacher samples used as clean prefixes in `teacher_forcing` mode and teacher-cache generation. `--cfg-scale` controls conditional/null score combination in the DMD loss and the student token prediction before latent normalization. The baseline cache uses guided teacher prefixes with `--teacher-sample-cfg-scale 4.6` and keeps distillation CFG at `--cfg-scale 1.0`.
 
 `--token-sample-size` subsamples raster positions for the distribution matching and fake score losses. It also controls the sampled positions for `--gan-domain latent_token`; image and latent-grid GANs still use the full generated grid.
 
 Implemented entry points:
 
 - `distill_dmd2/train.py`: DDP training with `torchrun`
+- `distill_dmd2/cache_teacher_prefixes.py`: DDP teacher-prefix latent cache generation
 - `distill_dmd2/sample_ddp.py`: DDP sampling with `torchrun`
-- `distill_dmd2/distiller.py`: teacher-forced prefixes, real prefixes, CFG, distribution matching, fake score training
+- `distill_dmd2/distiller.py`: teacher-forced prefixes, cached teacher prefixes, real prefixes, CFG, distribution matching, fake score training
 - `distill_dmd2/ar_utils.py`: AR backbone trainability, checkpoint, and DDP gradient helpers
 - `distill_dmd2/heads.py`: one-step student head and fake score head
 - `distill_dmd2/gan.py`: projection ResNet discriminator, discriminator builders, and adversarial losses
@@ -97,6 +102,33 @@ Use the matching model name when launching distillation:
 export MODEL=SphereAR-B
 ```
 
+## Teacher Prefix Cache
+
+Generate a teacher prefix cache before training with `--prefix-mode teacher_cache`:
+
+```bash
+export TEACHER_CKPT=/path/to/SphereAR_B.pt
+export DATA_PATH=/path/to/ILSVRC2012_img_train.tar
+export TEACHER_CACHE=/path/to/cache/spherear_b_teacher_cfg4.6_steps100_n1281167
+export MODEL=SphereAR-B
+
+torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
+  distill_dmd2/cache_teacher_prefixes.py \
+  --teacher-ckpt $TEACHER_CKPT \
+  --cache-dir $TEACHER_CACHE \
+  --data-path $DATA_PATH \
+  --model $MODEL \
+  --image-size 256 \
+  --patch-size 16 \
+  --latent-dim 16
+```
+
+For 256x256, `patch_size=16`, and `latent_dim=16`, each float16 prefix latent
+grid is `256 * 16 * 2 = 8192` bytes. Caching 1,281,167 ImageNet-scale prefixes
+therefore takes about 9.8 GiB for latent arrays, plus labels and shard metadata;
+budget roughly 10-11 GiB. The cache generator stores float16 latents by default.
+Cache generation defaults to `--batch-size 256` per GPU.
+
 ## Training
 
 Single-node 8-GPU A100 baseline example:
@@ -104,6 +136,7 @@ Single-node 8-GPU A100 baseline example:
 ```bash
 export DATA_PATH=/path/to/ILSVRC2012_img_train.tar
 export TEACHER_CKPT=/path/to/SphereAR_B.pt
+export TEACHER_CACHE=/path/to/cache/spherear_b_teacher_cfg4.6_steps100_n1281167
 export RESULT_DIR=/path/to/runs/spherear_b_dmd2
 export MODEL=SphereAR-B
 
@@ -124,9 +157,8 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --dm-weight 1.0 \
   --gan-weight 3e-3 \
   --dfake-gen-update-ratio 5 \
-  --prefix-mode teacher_forcing \
-  --teacher-sample-steps 100 \
-  --teacher-sample-cfg-scale 4.6 \
+  --prefix-mode teacher_cache \
+  --teacher-cache-dir $TEACHER_CACHE \
   --token-sample-size 256 \
   --cfg-scale 1.0 \
   --cfg-schedule linear \
@@ -147,6 +179,7 @@ Multi-node example:
 ```bash
 export DATA_PATH=/path/to/ILSVRC2012_img_train.tar
 export TEACHER_CKPT=/path/to/SphereAR_B.pt
+export TEACHER_CACHE=/path/to/cache/spherear_b_teacher_cfg4.6_steps100_n1281167
 export RESULT_DIR=/path/to/runs/spherear_b_dmd2
 export MODEL=SphereAR-B
 export WORKER_NUM=2
@@ -175,9 +208,8 @@ torchrun --nproc_per_node=8 \
   --dm-weight 1.0 \
   --gan-weight 3e-3 \
   --dfake-gen-update-ratio 5 \
-  --prefix-mode teacher_forcing \
-  --teacher-sample-steps 100 \
-  --teacher-sample-cfg-scale 4.6 \
+  --prefix-mode teacher_cache \
+  --teacher-cache-dir $TEACHER_CACHE \
   --token-sample-size 256 \
   --cfg-scale 1.0 \
   --cfg-schedule linear \
@@ -225,9 +257,8 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --dm-weight 1.0 \
   --gan-weight 3e-3 \
   --dfake-gen-update-ratio 5 \
-  --prefix-mode teacher_forcing \
-  --teacher-sample-steps 100 \
-  --teacher-sample-cfg-scale 4.6 \
+  --prefix-mode teacher_cache \
+  --teacher-cache-dir $TEACHER_CACHE \
   --token-sample-size 256 \
   --cfg-scale 1.0 \
   --cfg-schedule linear \

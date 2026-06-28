@@ -30,10 +30,8 @@ The dataloader drops incomplete effective batches at the end of an epoch.
 The default distillation baseline is:
 
 ```bash
---prefix-mode teacher_forcing
---teacher-sample-steps 100
---teacher-sample-cfg-scale 4.6
---teacher-sample-cfg-schedule linear
+--prefix-mode teacher_cache
+--teacher-cache-dir /path/to/teacher_cache
 --token-sample-size 256
 --cfg-scale 1.0
 --cfg-schedule linear
@@ -99,6 +97,9 @@ Flags:
 ```bash
 --prefix-mode teacher_forcing
 --prefix-mode real
+--prefix-mode teacher_cache
+--teacher-cache-dir /path/to/teacher_cache
+--teacher-cache-num-workers 4
 --self-forcing
 --self-forcing-detach-cache
 --no-self-forcing-detach-cache
@@ -108,6 +109,8 @@ Modes:
 
 - `teacher_forcing`: teacher samples a clean latent sequence first; the frozen
   AR trunk builds conditions from teacher clean prefixes.
+- `teacher_cache`: loads offline-cached teacher clean latent sequences; the
+  frozen AR trunk builds conditions from cached teacher clean prefixes.
 - `real`: VAE encodes the current real image batch; the frozen AR trunk builds
   conditions from real-image latent prefixes.
 - `--self-forcing`: second-stage mode used with `--prefix-mode teacher_forcing`.
@@ -129,6 +132,9 @@ Suggested comparisons:
 # Clean real-prefix diagnostic
 --prefix-mode real
 
+# Offline teacher-prefix cache
+--prefix-mode teacher_cache --teacher-cache-dir /path/to/teacher_cache
+
 # On-policy prefix second stage
 --prefix-mode teacher_forcing --self-forcing
 
@@ -148,8 +154,8 @@ Flags:
 ```
 
 These affect the teacher clean tokens used as prefixes in `teacher_forcing`
-mode. They are ignored by `--self-forcing`, because self-forcing prefixes come
-from the student autoregressive rollout.
+mode and teacher cache generation. They are ignored by `--self-forcing`, because
+self-forcing prefixes come from the student autoregressive rollout.
 
 Suggested comparisons:
 
@@ -165,6 +171,48 @@ Suggested comparisons:
 --teacher-sample-steps 50
 --teacher-sample-steps 100
 ```
+
+### Teacher Prefix Cache
+
+Entry point:
+
+```bash
+distill_dmd2/cache_teacher_prefixes.py
+```
+
+Recommended full-dataset cache-generation flags:
+
+```bash
+--cache-dir /path/to/teacher_cache
+--data-path /path/to/ILSVRC2012_img_train.tar
+```
+
+Cache-generation throughput flag:
+
+```bash
+--batch-size 256
+```
+
+Training flags:
+
+```bash
+--prefix-mode teacher_cache
+--teacher-cache-dir /path/to/teacher_cache
+--teacher-cache-num-workers 4
+```
+
+Behavior:
+
+- The cache stores teacher clean latent grids and labels.
+- The cache uses ImageNet labels from `--data-path` and writes one teacher
+  prefix per training example.
+- Cache generation defaults to 100 teacher sampling steps, teacher CFG 4.6,
+  bf16 autocast, and float16 storage.
+- On A100 80G, `--batch-size 256` is the recommended starting point.
+- Training still builds AR conditions online from the cached clean prefixes.
+- For 256x256, `patch_size=16`, and `latent_dim=16`, one float16 cached prefix
+  is 8192 bytes. A 1,281,167-sample ImageNet-scale cache is about 9.8 GiB for
+  latents and roughly 10-11 GiB including labels and metadata.
 
 ### Distillation CFG
 
@@ -536,9 +584,8 @@ loaded from the distillation checkpoint.
 Start from:
 
 ```bash
---prefix-mode teacher_forcing
---teacher-sample-steps 100
---teacher-sample-cfg-scale 4.6
+--prefix-mode teacher_cache
+--teacher-cache-dir /path/to/teacher_cache
 --token-sample-size 256
 --cfg-scale 1.0
 --disc-type resnet
@@ -552,6 +599,7 @@ Then sweep one axis at a time:
 # Prefix mode
 --prefix-mode teacher_forcing
 --prefix-mode real
+--prefix-mode teacher_cache --teacher-cache-dir /path/to/teacher_cache
 --prefix-mode teacher_forcing --self-forcing
 --prefix-mode teacher_forcing --self-forcing --no-self-forcing-detach-cache
 
