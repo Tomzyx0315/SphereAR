@@ -11,6 +11,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import torch
+
+
+def _identity_compile(fn=None, *args, **kwargs):
+    if fn is None:
+        return lambda inner_fn: inner_fn
+    return fn
+
+
+if "--compile-model" not in sys.argv:
+    torch.compile = _identity_compile
+
 import torch.distributed as dist
 from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -399,6 +410,7 @@ def main(args):
     else:
         logger = create_logger(None)
     logger.info(args)
+    logger.info(f"torch.compile enabled: {args.compile_model}")
 
     if args.resume and args.init_from:
         raise ValueError("--resume and --init-from are mutually exclusive.")
@@ -817,6 +829,11 @@ if __name__ == "__main__":
     parser = get_model_args()
     parser.add_argument("--teacher-ckpt", type=str, required=True)
     parser.add_argument("--teacher-no-ema", action="store_true")
+    parser.add_argument(
+        "--compile-model",
+        action="store_true",
+        help="Keep SphereAR torch.compile decorators active during distillation training. Disabled by default.",
+    )
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="dmd2_results")
     parser.add_argument("--resume", type=str, default="")

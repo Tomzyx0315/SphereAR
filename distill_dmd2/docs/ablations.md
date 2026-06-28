@@ -32,7 +32,7 @@ The default distillation baseline is:
 ```bash
 --prefix-mode teacher_forcing
 --teacher-sample-steps 100
---teacher-sample-cfg-scale 2.5
+--teacher-sample-cfg-scale 4.6
 --teacher-sample-cfg-schedule linear
 --token-sample-size 256
 --cfg-scale 1.0
@@ -158,7 +158,7 @@ Suggested comparisons:
 --teacher-sample-cfg-scale 1.0
 
 # Guided teacher prefixes
---teacher-sample-cfg-scale 4.5
+--teacher-sample-cfg-scale 4.6
 
 # Cheaper teacher sampling
 --teacher-sample-steps 25
@@ -354,6 +354,22 @@ Suggested comparisons:
 --mixed-precision none
 ```
 
+### Torch Compile
+
+Flag:
+
+```bash
+--compile-model
+```
+
+Behavior:
+
+- Distillation training disables the SphereAR `torch.compile` decorators by
+  default for both stage 1 and stage 2.
+- `--compile-model` keeps those decorators active as an experimental ablation.
+- This ablation currently has known bugs in the distillation training path, so
+  the recommended commands leave it off.
+
 ### Batch, Schedule, Logging, Checkpointing
 
 Flags:
@@ -522,7 +538,7 @@ Start from:
 ```bash
 --prefix-mode teacher_forcing
 --teacher-sample-steps 100
---teacher-sample-cfg-scale 2.5
+--teacher-sample-cfg-scale 4.6
 --token-sample-size 256
 --cfg-scale 1.0
 --disc-type resnet
@@ -552,8 +568,8 @@ Then sweep one axis at a time:
 
 # CFG
 --teacher-sample-cfg-scale 1.0 --cfg-scale 1.0
---teacher-sample-cfg-scale 4.5 --cfg-scale 1.0
---teacher-sample-cfg-scale 4.5 --cfg-scale 4.5
+--teacher-sample-cfg-scale 4.6 --cfg-scale 1.0
+--teacher-sample-cfg-scale 4.6 --cfg-scale 4.5
 
 # GAN strength
 --gan-domain image --gan-weight 3e-3
@@ -562,4 +578,7 @@ Then sweep one axis at a time:
 --gan-weight 1e-3
 --gan-weight 3e-3
 --gan-weight 1e-2
+
+# Compile ablation
+--compile-model
 ```

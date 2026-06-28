@@ -19,7 +19,7 @@ The generator objective is the weighted sum of:
 
 The fake score head is also initialized from the teacher diffusion head and is trained online on generated latents. The discriminator is trained on real ImageNet images with their dataset labels and decoded student samples with their sampled class labels. The same generated batch is reused for the student update, fake score update, and discriminator fake branch.
 
-Classifier-free guidance has two controls. `--teacher-sample-cfg-scale` controls the teacher samples used as clean prefixes in `teacher_forcing` mode. `--cfg-scale` controls conditional/null score combination in the DMD loss and the student token prediction before latent normalization. The single-node baseline uses guided teacher prefixes with `--teacher-sample-cfg-scale 2.5` and keeps distillation CFG at `--cfg-scale 1.0`.
+Classifier-free guidance has two controls. `--teacher-sample-cfg-scale` controls the teacher samples used as clean prefixes in `teacher_forcing` mode. `--cfg-scale` controls conditional/null score combination in the DMD loss and the student token prediction before latent normalization. The single-node baseline uses guided teacher prefixes with `--teacher-sample-cfg-scale 4.6` and keeps distillation CFG at `--cfg-scale 1.0`.
 
 `--token-sample-size` subsamples raster positions for the distribution matching and fake score losses. It also controls the sampled positions for `--gan-domain latent_token`; image and latent-grid GANs still use the full generated grid.
 
@@ -126,7 +126,7 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --dfake-gen-update-ratio 5 \
   --prefix-mode teacher_forcing \
   --teacher-sample-steps 100 \
-  --teacher-sample-cfg-scale 2.5 \
+  --teacher-sample-cfg-scale 4.6 \
   --token-sample-size 256 \
   --cfg-scale 1.0 \
   --cfg-schedule linear \
@@ -177,7 +177,7 @@ torchrun --nproc_per_node=8 \
   --dfake-gen-update-ratio 5 \
   --prefix-mode teacher_forcing \
   --teacher-sample-steps 100 \
-  --teacher-sample-cfg-scale 1.0 \
+  --teacher-sample-cfg-scale 4.6 \
   --token-sample-size 64 \
   --cfg-scale 1.0 \
   --gan-domain image \
@@ -194,6 +194,8 @@ $RESULT_DIR/epoch_*.pt
 ```
 
 The single-node command logs every 50 optimizer steps, overwrites `last.pt` every 1000 optimizer steps, and saves 16 preview PNGs plus a grid every 1000 optimizer steps. Training-time preview sampling does not run FID/IS.
+
+Distillation training disables SphereAR `torch.compile` decorators by default. Use `--compile-model` only as an experimental ablation.
 
 Resume from an existing run with optimizer, epoch, and step restored:
 
@@ -218,7 +220,7 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --dfake-gen-update-ratio 5 \
   --prefix-mode teacher_forcing \
   --teacher-sample-steps 100 \
-  --teacher-sample-cfg-scale 2.5 \
+  --teacher-sample-cfg-scale 4.6 \
   --token-sample-size 256 \
   --cfg-scale 1.0 \
   --cfg-schedule linear \
