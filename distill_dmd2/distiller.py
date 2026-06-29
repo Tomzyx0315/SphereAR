@@ -79,6 +79,56 @@ class SphereARDMD2Distiller:
         return latents
 
     @torch.no_grad()
+    def apply_prefix_noise(
+        self,
+        latents,
+        noise_prob=0.0,
+        t_min=0.8,
+        t_max=1.0,
+        prob_start=0.0,
+        schedule="constant",
+    ):
+        if noise_prob <= 0.0 and prob_start <= 0.0:
+            return latents
+        if not (0.0 <= prob_start <= 1.0 and 0.0 <= noise_prob <= 1.0):
+            raise ValueError(
+                "prefix noise probabilities must be in [0, 1], "
+                f"got start={prob_start}, end={noise_prob}"
+            )
+        if not (0.0 <= t_min <= t_max <= 1.0):
+            raise ValueError(
+                "prefix noise t range must satisfy 0 <= t_min <= t_max <= 1, "
+                f"got {t_min}, {t_max}"
+            )
+
+        mask_shape = latents.shape[:2]
+        if schedule == "constant":
+            prob = torch.full(mask_shape, noise_prob, device=latents.device)
+        elif schedule == "linear":
+            if prob_start > noise_prob:
+                raise ValueError(
+                    "linear prefix noise schedule requires "
+                    f"prob_start <= noise_prob, got {prob_start} > {noise_prob}"
+                )
+            seq_len = latents.shape[1]
+            if seq_len == 1:
+                pos_prob = torch.full((1,), noise_prob, device=latents.device)
+            else:
+                progress = torch.linspace(0.0, 1.0, seq_len, device=latents.device)
+                pos_prob = prob_start + (noise_prob - prob_start) * progress
+            prob = pos_prob.unsqueeze(0).expand(mask_shape)
+        else:
+            raise ValueError(f"Unknown prefix noise schedule: {schedule}")
+        mask = torch.rand(mask_shape, device=latents.device) < prob
+
+        t = torch.empty(mask_shape, device=latents.device, dtype=torch.float32)
+        t.uniform_(t_min, t_max)
+        t = t.to(dtype=latents.dtype).unsqueeze(-1)
+        noise = torch.randn_like(latents)
+        mixed = t * latents + (1.0 - t) * noise
+        return torch.where(mask.unsqueeze(-1), mixed, latents)
+
+    @torch.no_grad()
     def sample_teacher_latents(
         self,
         class_id,
@@ -181,10 +231,28 @@ class SphereARDMD2Distiller:
         latents = self._generate_from_conditions(class_id, conds, requires_grad)
         return latents, conds
 
-    def generate_latents_real_prefix(self, class_id, real_latents, requires_grad):
+    def generate_latents_real_prefix(
+        self,
+        class_id,
+        real_latents,
+        requires_grad,
+        prefix_noise_prob=0.0,
+        prefix_noise_t_min=0.8,
+        prefix_noise_t_max=1.0,
+        prefix_noise_prob_start=0.0,
+        prefix_noise_schedule="constant",
+    ):
         if real_latents is None:
             raise ValueError("real prefix mode requires real_latents.")
-        conds = self.teacher_forced_conditions(class_id, real_latents)
+        prefix_latents = self.apply_prefix_noise(
+            real_latents,
+            noise_prob=prefix_noise_prob,
+            t_min=prefix_noise_t_min,
+            t_max=prefix_noise_t_max,
+            prob_start=prefix_noise_prob_start,
+            schedule=prefix_noise_schedule,
+        )
+        conds = self.teacher_forced_conditions(class_id, prefix_latents)
         latents = self._generate_from_conditions(class_id, conds, requires_grad)
         return latents, conds
 
@@ -271,6 +339,11 @@ class SphereARDMD2Distiller:
         teacher_cfg_schedule="linear",
         self_forcing=False,
         self_forcing_detach_cache=False,
+        prefix_noise_prob=0.0,
+        prefix_noise_t_min=0.8,
+        prefix_noise_t_max=1.0,
+        prefix_noise_prob_start=0.0,
+        prefix_noise_schedule="constant",
     ):
         if self_forcing:
             if prefix_mode != "teacher_forcing":
@@ -293,12 +366,22 @@ class SphereARDMD2Distiller:
                 class_id,
                 real_latents=real_latents,
                 requires_grad=requires_grad,
+                prefix_noise_prob=prefix_noise_prob,
+                prefix_noise_t_min=prefix_noise_t_min,
+                prefix_noise_t_max=prefix_noise_t_max,
+                prefix_noise_prob_start=prefix_noise_prob_start,
+                prefix_noise_schedule=prefix_noise_schedule,
             )
         if prefix_mode == "teacher_cache":
             return self.generate_latents_real_prefix(
                 class_id,
                 real_latents=real_latents,
                 requires_grad=requires_grad,
+                prefix_noise_prob=prefix_noise_prob,
+                prefix_noise_t_min=prefix_noise_t_min,
+                prefix_noise_t_max=prefix_noise_t_max,
+                prefix_noise_prob_start=prefix_noise_prob_start,
+                prefix_noise_schedule=prefix_noise_schedule,
             )
         raise ValueError(f"Unknown prefix mode: {prefix_mode}")
 

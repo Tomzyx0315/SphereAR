@@ -8,7 +8,7 @@ The distillation pipeline trains a one-step student head on top of a frozen Sphe
 
 The student head is initialized from the teacher diffusion head. For each generated latent token, the one-step prediction is normalized with the same VAE latent normalization used by SphereAR sampling. The generated latent grid is decoded by the frozen VAE for the GAN generator loss.
 
-The training code also supports `real` prefixes, which use VAE latents from the current real batch. Sampling uses the autoregressive student path.
+The training code also supports `real` prefixes, which use VAE latents from the current real batch. `real` and `teacher_cache` prefixes can optionally add token-wise prefix noise before AR conditioning. Sampling uses the autoregressive student path.
 
 `teacher_cache` prefixes use offline-cached teacher clean latent grids. The AR
 conditions are still built online from those cached clean prefixes, but the
@@ -330,6 +330,7 @@ Useful training options:
 --init-from /path/to/stage1/last.pt
 --disc-dim 64
 --prefix-mode real
+--prefix-noise-schedule linear --prefix-noise-prob-start 0.0 --prefix-noise-prob 0.25 --prefix-noise-t-min 0.8 --prefix-noise-t-max 1.0
 --self-forcing
 --no-self-forcing-detach-cache
 --gan-domain image

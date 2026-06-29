@@ -425,9 +425,37 @@ def main(args):
     if args.resume and args.init_from:
         raise ValueError("--resume and --init-from are mutually exclusive.")
     if args.self_forcing and args.prefix_mode != "teacher_forcing":
-        raise ValueError("--self-forcing is only supported with --prefix-mode teacher_forcing.")
+        raise ValueError(
+            "--self-forcing is only supported with --prefix-mode teacher_forcing."
+        )
     if args.prefix_mode == "teacher_cache" and not args.teacher_cache_dir:
         raise ValueError("--prefix-mode teacher_cache requires --teacher-cache-dir.")
+    prefix_noise_enabled = (
+        args.prefix_noise_prob > 0.0 or args.prefix_noise_prob_start > 0.0
+    )
+    if prefix_noise_enabled and args.prefix_mode not in {
+        "real",
+        "teacher_cache",
+    }:
+        raise ValueError(
+            "--prefix-noise-prob is only supported with --prefix-mode real or teacher_cache."
+        )
+    if not (0.0 <= args.prefix_noise_prob <= 1.0):
+        raise ValueError("--prefix-noise-prob must be in [0, 1].")
+    if not (0.0 <= args.prefix_noise_prob_start <= 1.0):
+        raise ValueError("--prefix-noise-prob-start must be in [0, 1].")
+    if (
+        args.prefix_noise_schedule == "linear"
+        and args.prefix_noise_prob_start > args.prefix_noise_prob
+    ):
+        raise ValueError(
+            "--prefix-noise-schedule linear requires "
+            "--prefix-noise-prob-start <= --prefix-noise-prob."
+        )
+    if not (0.0 <= args.prefix_noise_t_min <= args.prefix_noise_t_max <= 1.0):
+        raise ValueError(
+            "--prefix-noise-t-min/t-max must satisfy 0 <= min <= max <= 1."
+        )
     teacher = load_teacher(args, device, logger)
     set_ar_backbone_trainable(teacher, args.self_forcing)
     student_head = OneStepHead(teacher.head).to(device)
@@ -550,6 +578,12 @@ def main(args):
         f"Self-forcing: {args.self_forcing}; "
         f"trainable student/generator params: {count_parameters(generator_params):,}; "
         f"trainable AR backbone params: {count_parameters(list(ar_backbone_parameters(teacher))):,}"
+    )
+    logger.info(
+        f"Clean prefix noise: prob={args.prefix_noise_prob}; "
+        f"prob_start={args.prefix_noise_prob_start}; "
+        f"schedule={args.prefix_noise_schedule}; "
+        f"t_range=[{args.prefix_noise_t_min}, {args.prefix_noise_t_max}]"
     )
 
     distiller = SphereARDMD2Distiller(
@@ -674,6 +708,11 @@ def main(args):
                             teacher_cfg_schedule=args.teacher_sample_cfg_schedule,
                             self_forcing=args.self_forcing,
                             self_forcing_detach_cache=args.self_forcing_detach_cache,
+                            prefix_noise_prob=args.prefix_noise_prob,
+                            prefix_noise_t_min=args.prefix_noise_t_min,
+                            prefix_noise_t_max=args.prefix_noise_t_max,
+                            prefix_noise_prob_start=args.prefix_noise_prob_start,
+                            prefix_noise_schedule=args.prefix_noise_schedule,
                         )
                         position_indices = sample_position_indices(
                             generated_latents.shape[1],
@@ -960,6 +999,37 @@ if __name__ == "__main__":
         type=int,
         default=-1,
         help="Number of raster positions used by DM/fake-score losses per step; <=0 uses all positions.",
+    )
+    parser.add_argument(
+        "--prefix-noise-prob",
+        type=float,
+        default=0.0,
+        help="End/max per-token probability of noising clean real/cache prefixes before AR conditioning.",
+    )
+    parser.add_argument(
+        "--prefix-noise-prob-start",
+        type=float,
+        default=0.0,
+        help="Start probability for linear clean-prefix noising.",
+    )
+    parser.add_argument(
+        "--prefix-noise-schedule",
+        type=str,
+        default="constant",
+        choices=["constant", "linear"],
+        help="Position schedule for clean-prefix noising probability.",
+    )
+    parser.add_argument(
+        "--prefix-noise-t-min",
+        type=float,
+        default=0.8,
+        help="Lower bound for t in noisy_prefix = t * clean + (1 - t) * noise.",
+    )
+    parser.add_argument(
+        "--prefix-noise-t-max",
+        type=float,
+        default=1.0,
+        help="Upper bound for t in noisy_prefix = t * clean + (1 - t) * noise.",
     )
     parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument(

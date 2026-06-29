@@ -100,6 +100,12 @@ Flags:
 --prefix-mode teacher_cache
 --teacher-cache-dir /path/to/teacher_cache
 --teacher-cache-num-workers 4
+--prefix-noise-prob 0.0
+--prefix-noise-prob-start 0.0
+--prefix-noise-schedule constant
+--prefix-noise-schedule linear
+--prefix-noise-t-min 0.8
+--prefix-noise-t-max 1.0
 --self-forcing
 --self-forcing-detach-cache
 --no-self-forcing-detach-cache
@@ -113,6 +119,14 @@ Modes:
   frozen AR trunk builds conditions from cached teacher clean prefixes.
 - `real`: VAE encodes the current real image batch; the frozen AR trunk builds
   conditions from real-image latent prefixes.
+- `--prefix-noise-prob`: end/max per-token probability of corrupting clean
+  `real` or `teacher_cache` prefixes before AR conditioning. With
+  `--prefix-noise-schedule constant`, all raster positions use this probability.
+  With `--prefix-noise-schedule linear`, the probability grows from
+  `--prefix-noise-prob-start` at the first token to `--prefix-noise-prob` at the
+  last token. Selected tokens use
+  `t * clean + (1 - t) * noise`, with `t` sampled uniformly from
+  `[--prefix-noise-t-min, --prefix-noise-t-max]`.
 - `--self-forcing`: second-stage mode used with `--prefix-mode teacher_forcing`.
   The student rolls out tokens autoregressively, position `i` is conditioned on
   generated tokens `< i`, and the AR backbone is trained together with the
@@ -131,6 +145,12 @@ Suggested comparisons:
 
 # Clean real-prefix diagnostic
 --prefix-mode real
+
+# Noisy real-prefix diagnostic
+--prefix-mode real --prefix-noise-prob 0.25 --prefix-noise-t-min 0.8
+
+# Linear noisy real-prefix diagnostic
+--prefix-mode real --prefix-noise-schedule linear --prefix-noise-prob-start 0.0 --prefix-noise-prob 0.25 --prefix-noise-t-min 0.8
 
 # Offline teacher-prefix cache
 --prefix-mode teacher_cache --teacher-cache-dir /path/to/teacher_cache
@@ -613,6 +633,13 @@ Then sweep one axis at a time:
 --teacher-sample-steps 25
 --teacher-sample-steps 50
 --teacher-sample-steps 100
+
+# Clean-prefix noise
+--prefix-mode real --prefix-noise-prob 0.1 --prefix-noise-t-min 0.9
+--prefix-mode real --prefix-noise-prob 0.25 --prefix-noise-t-min 0.8
+--prefix-mode real --prefix-noise-prob 0.5 --prefix-noise-t-min 0.8
+--prefix-mode real --prefix-noise-schedule linear --prefix-noise-prob-start 0.0 --prefix-noise-prob 0.25 --prefix-noise-t-min 0.8
+--prefix-mode real --prefix-noise-schedule linear --prefix-noise-prob-start 0.05 --prefix-noise-prob 0.5 --prefix-noise-t-min 0.8
 
 # CFG
 --teacher-sample-cfg-scale 1.0 --cfg-scale 1.0
