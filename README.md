@@ -171,6 +171,7 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --preview-every 1000 \
   --preview-num 16 \
   --preview-batch-size 8 \
+  --tensorboard \
   --mixed-precision bf16
 ```
 
@@ -222,6 +223,7 @@ torchrun --nproc_per_node=8 \
   --preview-every 1000 \
   --preview-num 16 \
   --preview-batch-size 8 \
+  --tensorboard \
   --mixed-precision bf16
 ```
 
@@ -271,6 +273,7 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --preview-every 1000 \
   --preview-num 16 \
   --preview-batch-size 8 \
+  --tensorboard \
   --mixed-precision bf16
 ```
 
@@ -316,6 +319,7 @@ torchrun --nnodes=1 --nproc_per_node=8 --node_rank=0 \
   --preview-every 1000 \
   --preview-num 16 \
   --preview-batch-size 8 \
+  --tensorboard \
   --mixed-precision bf16
 ```
 

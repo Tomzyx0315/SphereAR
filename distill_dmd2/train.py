@@ -6,6 +6,8 @@ import time
 from contextlib import ExitStack
 from pathlib import Path
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -27,6 +29,7 @@ from PIL import Image
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 
 from SphereAR.dataset import build_dataset
 from SphereAR.model import create_model, get_model_args
@@ -143,10 +146,11 @@ def save_image_grid(images, path):
         row, col = divmod(idx, cols)
         grid.paste(Image.fromarray(image), (col * width, row * height))
     grid.save(path)
+    return grid
 
 
 @torch.no_grad()
-def save_preview_samples(args, distiller, step, device, ptdtype, logger):
+def save_preview_samples(args, distiller, step, device, ptdtype, logger, tb_writer=None):
     if args.preview_every <= 0 or args.preview_num <= 0:
         return
 
@@ -191,7 +195,10 @@ def save_preview_samples(args, distiller, step, device, ptdtype, logger):
                     saved_images.append(sample)
                     image_idx += 1
                 remaining -= current_batch
-        save_image_grid(saved_images, os.path.join(step_dir, "grid.png"))
+        grid = save_image_grid(saved_images, os.path.join(step_dir, "grid.png"))
+        if tb_writer is not None and grid is not None:
+            grid_tensor = torch.from_numpy(np.asarray(grid)).permute(2, 0, 1).contiguous()
+            tb_writer.add_image("images/fixed_samples", grid_tensor, step)
         logger.info(f"Saved {len(saved_images)} preview samples to {step_dir}")
     finally:
         if args.self_forcing:
@@ -338,6 +345,64 @@ def reduce_scalar(value, device):
     return value / dist.get_world_size()
 
 
+def create_tb_writer(args, rank, logger):
+    if rank != 0:
+        return None
+    log_dir = args.tensorboard_dir or os.path.join(args.results_dir, "tensorboard")
+    writer = SummaryWriter(log_dir=log_dir)
+    logger.info(f"TensorBoard logs will be written to {log_dir}")
+    return writer
+
+
+def tensorboard_tag(key):
+    mapping = {
+        "student_loss": "loss/student_total",
+        "dm_loss": "loss/dm",
+        "gan_g_loss": "loss/gan_g",
+        "fake_score_loss": "loss/fake_score",
+        "disc_loss": "loss/discriminator",
+        "dm_grad_norm": "dmd/grad_norm",
+        "dm_real_fake_gap": "dmd/teacher_fake_gap",
+        "logits_real_mean": "gan/logits_real_mean",
+        "logits_fake_mean": "gan/logits_fake_mean",
+        "grad_student_norm": "grad/student_norm",
+        "grad_fake_score_norm": "grad/fake_score_norm",
+        "grad_discriminator_norm": "grad/discriminator_norm",
+        "grad_ar_backbone_norm": "grad/ar_backbone_norm",
+    }
+    return mapping.get(key)
+
+
+def write_tensorboard_scalars(
+    writer,
+    logs,
+    train_steps,
+    steps_per_sec,
+    opt_student,
+    opt_fake,
+    opt_disc,
+):
+    if writer is None:
+        return
+    for key, value in logs.items():
+        tag = tensorboard_tag(key)
+        if tag is not None:
+            writer.add_scalar(tag, value, train_steps)
+    writer.add_scalar("train/steps_per_sec", steps_per_sec, train_steps)
+    writer.add_scalar("train/lr_student", opt_student.param_groups[0]["lr"], train_steps)
+    writer.add_scalar("train/lr_fake_score", opt_fake.param_groups[0]["lr"], train_steps)
+    if opt_disc is not None:
+        writer.add_scalar(
+            "train/lr_discriminator", opt_disc.param_groups[0]["lr"], train_steps
+        )
+    writer.add_scalar(
+        "train/gpu_mem_gb",
+        torch.cuda.max_memory_allocated() / (1024**3),
+        train_steps,
+    )
+    writer.flush()
+
+
 def ddp_sync_context(modules, sync_gradients):
     stack = ExitStack()
     if not sync_gradients:
@@ -403,6 +468,14 @@ def count_parameters(params):
     return sum(param.numel() for param in params if param.requires_grad)
 
 
+def grad_norm(parameters, device):
+    params = [p for p in parameters if p.grad is not None]
+    if not params:
+        return torch.tensor(0.0, device=device)
+    norms = [p.grad.detach().float().norm(2) for p in params]
+    return torch.norm(torch.stack(norms), 2)
+
+
 def main(args):
     assert torch.cuda.is_available(), "DMD2 distillation requires CUDA."
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -421,6 +494,7 @@ def main(args):
         logger = create_logger(None)
     logger.info(args)
     logger.info(f"torch.compile enabled: {args.compile_model}")
+    tb_writer = create_tb_writer(args, rank, logger)
 
     if args.resume and args.init_from:
         raise ValueError("--resume and --init-from are mutually exclusive.")
@@ -477,7 +551,8 @@ def main(args):
     if discriminator is not None:
         discriminator = DDP(discriminator, device_ids=[args.gpu])
 
-    generator_params = list(student_head.parameters())
+    student_params = list(student_head.parameters())
+    generator_params = list(student_params)
     if args.self_forcing:
         generator_params += list(ar_backbone_parameters(teacher))
     opt_student = create_optimizer(generator_params, args.student_lr, args.weight_decay)
@@ -802,12 +877,18 @@ def main(args):
                                 logits_real, logits_fake, args.gan_loss
                             )
                         (disc_loss * accum_scale).backward()
+                        gan_logs = {
+                            "logits_real_mean": logits_real.detach().float().mean(),
+                            "logits_fake_mean": logits_fake.detach().float().mean(),
+                        }
                     else:
                         disc_loss = torch.tensor(0.0, device=device)
+                        gan_logs = {}
 
                     micro_logs = {
                         "fake_score_loss": fake_score_loss.detach(),
                         "disc_loss": disc_loss.detach(),
+                        **gan_logs,
                     }
                     if do_generator_update:
                         micro_logs.update(
@@ -823,25 +904,43 @@ def main(args):
 
             if do_generator_update:
                 if args.self_forcing:
-                    all_reduce_trainable_grads(ar_backbone_parameters(teacher))
+                    ar_params = list(ar_backbone_parameters(teacher))
+                    all_reduce_trainable_grads(ar_params)
+                else:
+                    ar_params = []
+                student_grad_norm = grad_norm(student_params, device)
+                if args.self_forcing:
+                    ar_grad_norm = grad_norm(ar_params, device)
                 if args.max_grad_norm > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        generator_params, args.max_grad_norm
+                    torch.nn.utils.clip_grad_norm_(generator_params, args.max_grad_norm)
+                step_logs["grad_student_norm"] = float(student_grad_norm.detach().float())
+                if args.self_forcing:
+                    step_logs["grad_ar_backbone_norm"] = float(
+                        ar_grad_norm.detach().float()
                     )
                 opt_student.step()
+            fake_grad_norm = grad_norm(fake_score_head.parameters(), device)
             if args.max_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(
                     fake_score_head.parameters(), args.max_grad_norm
                 )
+            step_logs["grad_fake_score_norm"] = float(fake_grad_norm.detach().float())
             opt_fake.step()
             if discriminator is not None and args.gan_weight > 0:
+                disc_grad_norm = grad_norm(discriminator.parameters(), device)
                 if args.max_grad_norm > 0:
                     torch.nn.utils.clip_grad_norm_(
                         discriminator.parameters(), args.max_grad_norm
                     )
+                step_logs["grad_discriminator_norm"] = float(
+                    disc_grad_norm.detach().float()
+                )
                 opt_disc.step()
 
-            logs = {k: v / args.grad_accum_steps for k, v in step_logs.items()}
+            logs = {}
+            for k, v in step_logs.items():
+                denom = 1.0 if k.startswith("grad_") else args.grad_accum_steps
+                logs[k] = v / denom
             for k, v in logs.items():
                 running[k] = running.get(k, 0.0) + v
                 running_counts[k] = running_counts.get(k, 0) + 1
@@ -852,7 +951,9 @@ def main(args):
             if train_steps % args.log_every == 0:
                 torch.cuda.synchronize()
                 elapsed = time.time() - start_time
+                steps_per_sec = log_count / max(elapsed, 1e-6)
                 parts = []
+                avg_logs = {}
                 for k in sorted(running):
                     stats = torch.tensor(
                         [running[k], running_counts[k]],
@@ -861,12 +962,23 @@ def main(args):
                     )
                     dist.all_reduce(stats, op=dist.ReduceOp.SUM)
                     avg = (stats[0] / stats[1].clamp_min(1.0)).item()
+                    avg_logs[k] = avg
                     parts.append(f"{k}: {avg:.4f}")
                 logger.info(
                     f"(step={train_steps:07d}) "
                     + ", ".join(parts)
-                    + f", steps/s: {log_count / max(elapsed, 1e-6):.2f}"
+                    + f", steps/s: {steps_per_sec:.2f}"
                 )
+                if rank == 0:
+                    write_tensorboard_scalars(
+                        tb_writer,
+                        avg_logs,
+                        train_steps,
+                        steps_per_sec,
+                        opt_student,
+                        opt_fake,
+                        opt_disc,
+                    )
                 running = {}
                 running_counts = {}
                 log_count = 0
@@ -901,6 +1013,7 @@ def main(args):
                         device,
                         ptdtype,
                         logger,
+                        tb_writer,
                     )
                 dist.barrier()
 
@@ -924,6 +1037,8 @@ def main(args):
         if train_steps >= max_steps:
             break
 
+    if tb_writer is not None:
+        tb_writer.close()
     logger.info("DMD2 distillation done.")
     dist.destroy_process_group()
 
@@ -1059,6 +1174,18 @@ if __name__ == "__main__":
     parser.add_argument("--preview-batch-size", type=int, default=0)
     parser.add_argument("--preview-dir", type=str, default="")
     parser.add_argument("--preview-seed", type=int, default=1234)
+    parser.add_argument(
+        "--tensorboard",
+        action="store_true",
+        default=True,
+        help="Write minimal TensorBoard scalars and preview image grids on rank 0.",
+    )
+    parser.add_argument(
+        "--tensorboard-dir",
+        type=str,
+        default="",
+        help="TensorBoard log directory. Defaults to $results_dir/tensorboard.",
+    )
     parser.add_argument(
         "--mixed-precision", type=str, default="bf16", choices=["none", "bf16"]
     )

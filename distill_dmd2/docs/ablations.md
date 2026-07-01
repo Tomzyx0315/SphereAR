@@ -458,6 +458,8 @@ Flags:
 --preview-batch-size 0
 --preview-dir ""
 --preview-seed 1234
+--tensorboard
+--tensorboard-dir /path/to/tensorboard
 --init-from ""
 ```
 
@@ -493,6 +495,17 @@ Preview behavior:
 - `--preview-batch-size <= 0` samples all preview images in one batch.
 - Preview sampling does not create `.npz` files and does not run FID/IS.
 - Other ranks wait at a barrier while rank 0 writes preview images.
+
+TensorBoard behavior:
+
+- Required for training. If `torch.utils.tensorboard` is unavailable, the
+  training script fails at startup.
+- Rank 0 writes logs to `$results_dir/tensorboard` unless `--tensorboard-dir`
+  is set.
+- Scalar logging follows `--log-every` and records `loss/*`, `dmd/*`, `gan/*`,
+  `grad/*`, `train/steps_per_sec`, `train/lr_*`, and `train/gpu_mem_gb`.
+- Preview grids are also written to `images/fixed_samples` when
+  `--preview-every > 0`.
 
 Resume and initialization behavior:
 
